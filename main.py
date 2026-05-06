@@ -15,8 +15,24 @@ import csv
 
 
 # ── Credential validation regex ──────────────────────────────────────────────
-# Matches  user@domain.tld:password  (password must be at least 1 char)
-CRED_PATTERN = re.compile(r'([^/:\s]+@[^/:\s]+\.[a-zA-Z]{2,}):(.+)$')
+# Format 1: user@domain.tld:password  (email-based)
+EMAIL_CRED_PATTERN = re.compile(r'([^/:\s]+@[^/:\s]+\.[a-zA-Z]{2,}):(.+)$')
+# Format 2: https://url:username:password  (username has no @ or /)
+URL_CRED_PATTERN = re.compile(r'(https?://\S+?):([^:@/\s]+):(\S+)$')
+# Keep alias for resume-loading compatibility
+CRED_PATTERN = EMAIL_CRED_PATTERN
+
+
+def parse_credential(line):
+    """Return (username_or_email, password, url_part) or None if no pattern matches."""
+    m = EMAIL_CRED_PATTERN.search(line)
+    if m:
+        url_part = line[:m.start()].rstrip(':').strip()
+        return m.group(1), m.group(2), url_part
+    m = URL_CRED_PATTERN.search(line)
+    if m:
+        return m.group(2), m.group(3), m.group(1)
+    return None
 
 # Maximum retries for FILE_VIEW API calls
 MAX_RETRIES = 3
@@ -205,14 +221,13 @@ try:
 
                 line_stripped = line.strip()
 
-                # password validation: only keep lines that look like user@domain:password
-                cred_match = CRED_PATTERN.search(line_stripped)
-                if not cred_match:
+                # password validation: only keep lines that look like credentials
+                parsed = parse_credential(line_stripped)
+                if not parsed:
                     log.debug(f"Skipped (no valid credential pattern): {line_stripped}")
                     continue
 
-                email = cred_match.group(1)
-                password = cred_match.group(2)
+                email, password, url_part = parsed
                 cred_key = f"{email}:{password}"
 
                 if cred_key in seen:
@@ -220,9 +235,6 @@ try:
                     continue
 
                 seen.add(cred_key)
-
-                # extract optional URL (everything before the email)
-                url_part = line_stripped[:cred_match.start()].rstrip(':').strip()
 
                 new_creds.append({
                     'url': url_part,
