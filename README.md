@@ -10,6 +10,11 @@ A fast OSINT tool for searching leaked credentials using the Intelligence X API.
 ✅ **Multiple output formats** - TXT, JSON, or CSV export  
 ✅ **Rate limiting & retry logic** - Handles API throttling with exponential backoff  
 ✅ **Credential validation** - Filters out false positives using regex patterns  
+✅ **Flexible extraction** - Supports `:`, `;`, `|`, and key/value credential dumps  
+✅ **Extraction modes** - `strict`, `balanced`, `aggressive` for precision/recall control  
+✅ **Confidence scoring** - Every match includes parser pattern + confidence score  
+✅ **Multi-hit line parsing** - Extracts multiple credentials from a single leak line  
+✅ **Safe-share export** - Optional anonymized CSV output for external clients  
 ✅ **Colored logging** - INFO/DEBUG modes with intuitive color-coded output  
 ✅ **Regex injection safe** - Properly escapes search patterns  
 
@@ -64,6 +69,18 @@ Get your API key from: [https://intelx.io/](https://intelx.io/)
 # Custom date range (12 months) and max results
 ./main.py -t domain.com -r 12 -m 500
 
+# More recall on noisy dumps
+./main.py -t domain.com --mode aggressive
+
+# Higher precision mode
+./main.py -t domain.com --mode strict
+
+# Create an anonymized safe-share file
+./main.py -t domain.com --safe-share
+
+# Custom name/path for safe-share file
+./main.py -t domain.com --safe-output client-report.csv
+
 # Enable debug logging
 ./main.py -t domain.com -d
 
@@ -79,6 +96,8 @@ Get your API key from: [https://intelx.io/](https://intelx.io/)
 ```
 usage: main.py [-h] -t TARGET [-m MAXRESULTS] [-k APIKEY] [-o OUTPUT]
                [-f {txt,json,csv}] [-r RANGE] [-d] [-e]
+               [--safe-share] [--safe-output SAFE_OUTPUT]
+               [--mode {aggressive,balanced,strict}]
 
 Search for leaked credentials
 
@@ -98,14 +117,34 @@ optional arguments:
                         Search range in months (default: 6)
   -d, --debug           Enable DEBUG logging
   -e, --email           Also search for @domain pattern
+  --safe-share          Generate a sanitized CSV file safe to share with
+                        external clients
+  --safe-output SAFE_OUTPUT
+                        Optional safe-share output filename (default:
+                        out/<output>-safe.csv)
+  --mode {aggressive,balanced,strict}
+                        Extraction mode: strict (precision), balanced
+                        (default), aggressive (recall)
 ```
+
+### Extraction Modes
+
+- **strict**: highest precision, drops low-confidence candidates
+- **balanced**: recommended default for most runs
+- **aggressive**: highest recall on noisy/non-standard dumps
+
+### Safe-Share Export
+
+- Add `--safe-share` to automatically produce an anonymized CSV for clients.
+- Add `--safe-output <filename>` to customize the safe-share file path/name.
+- The safe-share file includes `TARGET`, `User`, masked `Password`, and `Source`.
 
 ## Output Formats
 
 ### TXT Format (default)
 ```
 https://app.example.com:user@example.com:Password123!
-https://portal.example.com:admin@example.com:SecurePass456
+portal.example.com:admin:SecurePass456
 ```
 
 ### JSON Format
@@ -113,8 +152,13 @@ https://portal.example.com:admin@example.com:SecurePass456
 [
   {
     "url": "https://app.example.com",
+    "identity": "user@example.com",
     "email": "user@example.com",
     "password": "Password123!",
+    "confidence": 0.97,
+    "pattern": "url_delimited",
+    "canonical": "https://app.example.com:user@example.com:Password123!",
+    "raw_line": "https://app.example.com:user@example.com:Password123!",
     "source": "breach_2024_leak.txt"
   }
 ]
@@ -122,8 +166,8 @@ https://portal.example.com:admin@example.com:SecurePass456
 
 ### CSV Format
 ```csv
-url,email,password,source
-https://app.example.com,user@example.com,Password123!,breach_2024_leak.txt
+url,identity,email,password,source,confidence,pattern,canonical,raw_line
+https://app.example.com,user@example.com,user@example.com,Password123!,breach_2024_leak.txt,0.97,url_delimited,https://app.example.com:user@example.com:Password123!,https://app.example.com:user@example.com:Password123!
 ```
 
 ## Resume Capability
@@ -154,6 +198,8 @@ If the script is interrupted, simply re-run the same command. It will:
 - Individual leak processing
 - Duplicate detection
 - FILE_VIEW retry attempts
+- Skip reasons (`no valid credential pattern` / `low confidence` / `target mismatch`)
+- End-of-run extraction statistics
 
 ## Best Practices
 
@@ -167,7 +213,7 @@ If the script is interrupted, simply re-run the same command. It will:
 
 - IntelX API rate limits apply
 - Free tier has limited daily requests
-- Password validation requires `email:password` format
+- Password validation expects either `url:email:password` or `url:username:password`
 - TLD must be 2+ characters for credential matching
 
 ## Troubleshooting
