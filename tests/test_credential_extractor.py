@@ -2,9 +2,13 @@ import unittest
 
 from custom.credential_extractor import (
     EXTRACTION_MODES,
+    build_person_email_context,
+    build_search_terms,
     build_target_context,
+    candidate_mentions_person_email,
     candidate_mentions_target,
     extract_credentials_from_line,
+    is_email_target,
 )
 
 
@@ -68,6 +72,37 @@ class CredentialExtractorTests(unittest.TestCase):
 
         self.assertEqual(strict_candidates, [])
         self.assertTrue(aggressive_candidates)
+
+    def test_email_target_search_terms_include_person_variants(self):
+        terms = build_search_terms(
+            'andre.ferrario@icloud.com',
+            include_email_pattern=True,
+            person_name='Andrea Ferrario',
+        )
+        lowered_terms = {item.lower() for item in terms}
+
+        self.assertIn('andre.ferrario@icloud.com', lowered_terms)
+        self.assertIn('"andre.ferrario@icloud.com"', lowered_terms)
+        self.assertIn('@icloud.com', lowered_terms)
+        self.assertIn('andrea ferrario', lowered_terms)
+
+    def test_person_email_matching_is_not_domain_only(self):
+        context = build_person_email_context('andre.ferrario@icloud.com')
+
+        non_matching_candidate = {
+            'identity': 'random.user@icloud.com',
+            'url': 'icloud.com/login',
+            'canonical': 'icloud.com/login:random.user@icloud.com:Pass123!',
+        }
+        matching_candidate = {
+            'identity': 'andre.ferrario@icloud.com',
+            'url': 'icloud.com/login',
+            'canonical': 'icloud.com/login:andre.ferrario@icloud.com:Pass123!',
+        }
+
+        self.assertTrue(is_email_target('andre.ferrario@icloud.com'))
+        self.assertFalse(candidate_mentions_person_email(non_matching_candidate, non_matching_candidate['canonical'], context))
+        self.assertTrue(candidate_mentions_person_email(matching_candidate, matching_candidate['canonical'], context))
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ A fast OSINT tool for searching leaked credentials using the Intelligence X API.
 ✅ **Extraction modes** - `strict`, `balanced`, `aggressive` for precision/recall control  
 ✅ **Confidence scoring** - Every match includes parser pattern + confidence score  
 ✅ **Multi-hit line parsing** - Extracts multiple credentials from a single leak line  
+✅ **Person-email targeting** - Expands search terms and matches specifically for a person email  
 ✅ **Safe-share export** - Optional anonymized CSV output for external clients  
 ✅ **Colored logging** - INFO/DEBUG modes with intuitive color-coded output  
 ✅ **Regex injection safe** - Properly escapes search patterns  
@@ -58,6 +59,9 @@ Get your API key from: [https://intelx.io/](https://intelx.io/)
 # Search with email pattern enabled
 ./main.py -t domain.com -e
 
+# Search for a specific person email target
+./main.py -t andre.ferrario@icloud.com
+
 # Specify output format
 ./main.py -t domain.com -f csv
 ./main.py -t domain.com -f json
@@ -74,6 +78,9 @@ Get your API key from: [https://intelx.io/](https://intelx.io/)
 
 # Higher precision mode
 ./main.py -t domain.com --mode strict
+
+# Enrich person-email searches with full name terms
+./main.py -t andre.ferrario@icloud.com --person-name "Andrea Ferrario"
 
 # Create an anonymized safe-share file
 ./main.py -t domain.com --safe-share
@@ -96,6 +103,7 @@ Get your API key from: [https://intelx.io/](https://intelx.io/)
 ```
 usage: main.py [-h] -t TARGET [-m MAXRESULTS] [-k APIKEY] [-o OUTPUT]
                [-f {txt,json,csv}] [-r RANGE] [-d] [-e]
+               [--person-name PERSON_NAME]
                [--safe-share] [--safe-output SAFE_OUTPUT]
                [--mode {aggressive,balanced,strict}]
 
@@ -104,7 +112,7 @@ Search for leaked credentials
 optional arguments:
   -h, --help            show this help message and exit
   -t TARGET, --target TARGET
-                        The target domain to search for
+                        Target to search (domain or email)
   -m MAXRESULTS, --maxresults MAXRESULTS
                         Maximum number of results per bucket (default: 100)
   -k APIKEY, --apikey APIKEY
@@ -117,6 +125,9 @@ optional arguments:
                         Search range in months (default: 6)
   -d, --debug           Enable DEBUG logging
   -e, --email           Also search for @domain pattern
+  --person-name PERSON_NAME
+                        Optional full name to enrich person-email search
+                        terms
   --safe-share          Generate a sanitized CSV file safe to share with
                         external clients
   --safe-output SAFE_OUTPUT
@@ -132,6 +143,12 @@ optional arguments:
 - **strict**: highest precision, drops low-confidence candidates
 - **balanced**: recommended default for most runs
 - **aggressive**: highest recall on noisy/non-standard dumps
+
+### Person Target Search
+
+- If `--target` is an email address, the scanner automatically enables person-email mode.
+- Person-email mode expands search terms using email variations and local-part/name variants.
+- Use `--person-name` to enrich search terms for better recall on non-standard leaks.
 
 ### Safe-Share Export
 
