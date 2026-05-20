@@ -210,7 +210,7 @@ try:
     if not args.apikey:
         load_dotenv()
         args.apikey = os.getenv('INTELX_API_KEY')
-        log.debug(f"Using API key from environment variable: {args.apikey}")
+        log.debug("Using API key from environment variable: [hidden]")
     if not args.apikey:
         log.error("API key is required. Please provide it using -k or set INTELX_API_KEY in your environment variables.")
         sys.exit(1)
