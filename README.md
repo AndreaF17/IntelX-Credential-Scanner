@@ -147,8 +147,10 @@ optional arguments:
 ### Person Target Search
 
 - If `--target` is an email address, the scanner automatically enables person-email mode.
-- Person-email mode expands search terms using email variations and local-part/name variants.
-- Use `--person-name` to enrich search terms for better recall on non-standard leaks.
+- By default, person-email mode searches only the exact full email address.
+- It does not automatically search only the local-part (e.g. `info` from `info@example.it`).
+- Use `--person-name` to explicitly enrich search terms when you want broader recall.
+- Use `-e` if you explicitly want the broader `@domain` email-pattern search.
 
 ### Safe-Share Export
 

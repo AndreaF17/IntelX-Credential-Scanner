@@ -105,7 +105,7 @@ def is_email_target(target):
     return bool(EMAIL_TARGET_PATTERN.match(normalized))
 
 
-def _derive_person_name_variants(email, person_name=None):
+def _derive_person_name_variants(email, person_name=None, include_local_from_email=False):
     variants = []
     seen = set()
 
@@ -113,12 +113,13 @@ def _derive_person_name_variants(email, person_name=None):
     local_part, _, _ = email.partition('@')
     local_tokens = [token for token in re.split(r'[._\-]+', local_part) if token]
 
-    if local_part:
-        _add_unique(variants, seen, local_part)
+    if include_local_from_email:
+        if local_part:
+            _add_unique(variants, seen, local_part)
 
-    if len(local_tokens) >= 2:
-        _add_unique(variants, seen, f"{local_tokens[0]} {local_tokens[-1]}")
-        _add_unique(variants, seen, ''.join(local_tokens))
+        if len(local_tokens) >= 2:
+            _add_unique(variants, seen, f"{local_tokens[0]} {local_tokens[-1]}")
+            _add_unique(variants, seen, ''.join(local_tokens))
 
     if person_name:
         clean_name = ' '.join(person_name.strip().split())
@@ -147,15 +148,16 @@ def build_search_terms(target, include_email_pattern=False, person_name=None):
 
     if is_email_target(target_normalized):
         email_value = target_normalized.lower()
-        local_part, _, domain = email_value.partition('@')
+        _, _, domain = email_value.partition('@')
 
-        _add_unique(terms, seen, f'"{email_value}"')
-        _add_unique(terms, seen, email_value.replace('@', ' [at] '))
-        _add_unique(terms, seen, email_value.replace('@', '(at)'))
-        _add_unique(terms, seen, local_part)
-
-        for variant in _derive_person_name_variants(email_value, person_name=person_name):
-            _add_unique(terms, seen, variant)
+        # Default behavior: exact email only.
+        if person_name:
+            for variant in _derive_person_name_variants(
+                email_value,
+                person_name=person_name,
+                include_local_from_email=False,
+            ):
+                _add_unique(terms, seen, variant)
 
         if include_email_pattern and domain:
             _add_unique(terms, seen, f"@{domain}")
@@ -191,7 +193,11 @@ def build_person_email_context(email, person_name=None):
     """Build strict context for matching a specific person email target."""
     normalized_email = normalize_obfuscations(email.strip().lower())
     local_part, _, domain = normalized_email.partition('@')
-    name_variants = _derive_person_name_variants(normalized_email, person_name=person_name)
+    name_variants = _derive_person_name_variants(
+        normalized_email,
+        person_name=person_name,
+        include_local_from_email=False,
+    )
 
     return {
         'email': normalized_email,

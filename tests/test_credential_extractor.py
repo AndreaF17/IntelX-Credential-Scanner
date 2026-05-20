@@ -82,9 +82,13 @@ class CredentialExtractorTests(unittest.TestCase):
         lowered_terms = {item.lower() for item in terms}
 
         self.assertIn('andre.ferrario@icloud.com', lowered_terms)
-        self.assertIn('"andre.ferrario@icloud.com"', lowered_terms)
         self.assertIn('@icloud.com', lowered_terms)
         self.assertIn('andrea ferrario', lowered_terms)
+        self.assertNotIn('andre.ferrario', lowered_terms)
+
+    def test_email_target_default_uses_exact_email_only(self):
+        terms = build_search_terms('info@example.it', include_email_pattern=False, person_name=None)
+        self.assertEqual(terms, ['info@example.it'])
 
     def test_person_email_matching_is_not_domain_only(self):
         context = build_person_email_context('andre.ferrario@icloud.com')
