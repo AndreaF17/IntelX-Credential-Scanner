@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from intelxapi import intelx
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import re
@@ -12,32 +11,122 @@ import sys
 import time
 import json
 import csv
+import importlib
+
+from custom.credential_extractor import (
+    DEFAULT_MODE,
+    EXTRACTION_MODES,
+    build_target_context,
+    candidate_mentions_target,
+    extract_credentials_from_line,
+)
+from custom.parser import anonymize_password, parse_line_candidates
 
 
-# ── Credential validation regex ──────────────────────────────────────────────
-# Format 1: user@domain.tld:password  (email-based)
-EMAIL_CRED_PATTERN = re.compile(r'([^/:\s]+@[^/:\s]+\.[a-zA-Z]{2,}):(.+)$')
-# Format 2: https://url:username:password  (username has no @ or /)
-URL_CRED_PATTERN = re.compile(r'(https?://\S+?):([^:@/\s]+):(\S+)$')
-# Keep alias for resume-loading compatibility
-CRED_PATTERN = EMAIL_CRED_PATTERN
+def load_intelx_client():
+    """Load IntelX client constructor from available SDK package names."""
+    for module_name in ('intelxapi', 'intelx'):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
 
-
-def parse_credential(line):
-    """Return (username_or_email, password, url_part) or None if no pattern matches."""
-    m = EMAIL_CRED_PATTERN.search(line)
-    if m:
-        url_part = line[:m.start()].rstrip(':').strip()
-        return m.group(1), m.group(2), url_part
-    m = URL_CRED_PATTERN.search(line)
-    if m:
-        return m.group(2), m.group(3), m.group(1)
+        client = getattr(module, 'intelx', None)
+        if client is not None:
+            return client
     return None
+
+
+INTELX_CLIENT = load_intelx_client()
 
 # Maximum retries for FILE_VIEW API calls
 MAX_RETRIES = 3
 RETRY_DELAY = 2          # seconds, doubles after each retry
 REQUEST_DELAY = 0.5       # seconds between FILE_VIEW calls
+
+
+def resolve_safe_output_path(main_output_path, safe_output_arg):
+    """Resolve the destination path for the safe-share CSV output."""
+    if safe_output_arg:
+        if os.path.isabs(safe_output_arg) or safe_output_arg.startswith('out/'):
+            return safe_output_arg
+        return f"out/{safe_output_arg}"
+
+    base_name = os.path.splitext(os.path.basename(main_output_path))[0]
+    return os.path.join('out', f"{base_name}-safe.csv")
+
+
+def iter_credentials_for_safe_share(main_output_path, output_format):
+    """Yield normalized credential dicts from the main output file."""
+    if output_format == 'json':
+        with open(main_output_path, 'r') as f:
+            entries = json.load(f)
+
+        if isinstance(entries, list):
+            for entry in entries:
+                yield {
+                    'url': entry.get('url', ''),
+                    'identity': entry.get('identity') or entry.get('email', ''),
+                    'password': entry.get('password', ''),
+                    'source': entry.get('source', ''),
+                }
+
+    elif output_format == 'csv':
+        with open(main_output_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                yield {
+                    'url': row.get('url', ''),
+                    'identity': row.get('identity') or row.get('email', ''),
+                    'password': row.get('password', ''),
+                    'source': row.get('source', ''),
+                }
+
+    else:  # txt
+        with open(main_output_path, 'r') as f:
+            for line in f:
+                for target, user, password in parse_line_candidates(line):
+                    yield {
+                        'url': target,
+                        'identity': user,
+                        'password': password,
+                        'source': '',
+                    }
+
+
+def write_safe_share_file(main_output_path, output_format, safe_output_path):
+    """Create a sanitized CSV suitable for external sharing."""
+    safe_rows = []
+    seen = set()
+
+    for cred in iter_credentials_for_safe_share(main_output_path, output_format):
+        identity = (cred.get('identity') or '').strip()
+        password = (cred.get('password') or '').strip()
+        if not identity or not password:
+            continue
+
+        dedup_key = f"{identity.lower()}:{password}"
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        safe_rows.append({
+            'TARGET': cred.get('url', ''),
+            'User': identity,
+            'Password': anonymize_password(password),
+            'Source': cred.get('source', ''),
+        })
+
+    safe_dir = os.path.dirname(safe_output_path)
+    if safe_dir:
+        os.makedirs(safe_dir, exist_ok=True)
+
+    with open(safe_output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['TARGET', 'User', 'Password', 'Source'], delimiter=';')
+        writer.writeheader()
+        writer.writerows(safe_rows)
+
+    return len(safe_rows)
 
 
 # ── Argument parser ─────────────────────────────────────────────────────────
@@ -50,8 +139,29 @@ parser.add_argument('-f', '--format', type=str, choices=['txt', 'json', 'csv'], 
 parser.add_argument('-r', '--range', type=int, help='Search range in months', default=6)
 parser.add_argument('-d', '--debug', action='store_true', help='Enable DEBUG logging (default: INFO)')
 parser.add_argument('-e', '--email', action='store_true', help='Also search for @domain pattern')
+parser.add_argument(
+    '--safe-share',
+    action='store_true',
+    help='Generate a sanitized CSV file safe to share with external clients',
+)
+parser.add_argument(
+    '--safe-output',
+    type=str,
+    default=None,
+    help='Optional safe-share output filename (default: out/<output>-safe.csv)',
+)
+parser.add_argument(
+    '--mode',
+    type=str,
+    choices=sorted(EXTRACTION_MODES.keys()),
+    default=DEFAULT_MODE,
+    help='Extraction mode: strict (precision), balanced (default), aggressive (recall)',
+)
 
 args = parser.parse_args()
+
+if args.safe_output and not args.safe_share:
+    args.safe_share = True
 
 # Set default output filename based on target if not provided
 if not args.output:
@@ -107,7 +217,7 @@ log.info(f"Searching from {six_months_ago_formatted} to {today_formatted}")
 
 # ── IntelX search ────────────────────────────────────────────────────────────
 target = args.target
-escaped_target = re.escape(target)   # safe regex matching
+target_context = build_target_context(target)
 
 BUCKETS = ['leaks.private', 'leaks.public', 'leaks.private.li', 'pastes']
 
@@ -118,7 +228,11 @@ if args.email:
     log.info(f"Email search enabled: also searching for '{email_target}'")
 
 try:
-    ix = intelx(args.apikey)
+    if INTELX_CLIENT is None:
+        log.error("IntelX SDK not installed. Install dependencies with: pip install -r requirements.txt")
+        sys.exit(1)
+
+    ix = INTELX_CLIENT(args.apikey)
     log.debug(f"IntelX API initialized for target: {target}")
 
     all_results = []
@@ -165,22 +279,29 @@ if os.path.exists(output_file):
             with open(output_file, 'r') as f:
                 existing = json.load(f)
             for entry in existing:
-                cred_key = f"{entry.get('email', '')}:{entry.get('password', '')}"
-                seen.add(cred_key)
+                identity = entry.get('identity') or entry.get('email', '')
+                password = entry.get('password', '')
+                if identity and password:
+                    seen.add(f"{identity.lower()}:{password}")
         elif args.format == 'csv':
             with open(output_file, 'r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    cred_key = f"{row.get('email', '')}:{row.get('password', '')}"
-                    seen.add(cred_key)
+                    identity = row.get('identity') or row.get('email', '')
+                    password = row.get('password', '')
+                    if identity and password:
+                        seen.add(f"{identity.lower()}:{password}")
         else:  # txt
             with open(output_file, 'r') as f:
                 for line in f:
                     line = line.strip()
                     if line:
-                        cred_match = CRED_PATTERN.search(line)
-                        cred_key = cred_match.group(0) if cred_match else line
-                        seen.add(cred_key)
+                        candidates = extract_credentials_from_line(line, mode='aggressive')
+                        if candidates:
+                            for candidate in candidates:
+                                seen.add(candidate['dedup_key'])
+                        else:
+                            seen.add(line.lower())
         log.info(f"Loaded {len(seen)} existing credentials for dedup")
     except (json.JSONDecodeError, FileNotFoundError, StopIteration):
         log.warning(f"Could not parse existing output file, starting fresh dedup")
@@ -207,6 +328,16 @@ def file_view_with_retry(ix, leak, max_retries=MAX_RETRIES):
 
 # ── Process leaks ───────────────────────────────────────────────────────────
 new_creds = []   # list of dicts for json/csv output
+extraction_stats = {
+    'lines_scanned': 0,
+    'candidates_extracted': 0,
+    'pattern_skips': 0,
+    'low_confidence_skips': 0,
+    'target_skips': 0,
+    'multi_candidate_lines': 0,
+    'duplicates': 0,
+    'new_credentials': 0,
+}
 
 try:
     for i, leak in enumerate(results):
@@ -215,35 +346,67 @@ try:
             contents = file_view_with_retry(ix, leak)
 
             for line in contents.split('\n'):
-                # use escaped target for safe regex matching
-                if not re.search(escaped_target, line, re.IGNORECASE):
+                line_stripped = line.strip()
+                if not line_stripped:
                     continue
 
-                line_stripped = line.strip()
+                extraction_stats['lines_scanned'] += 1
 
-                # password validation: only keep lines that look like credentials
-                parsed = parse_credential(line_stripped)
-                if not parsed:
+                candidates = extract_credentials_from_line(line_stripped, mode=args.mode)
+                if not candidates:
+                    extraction_stats['pattern_skips'] += 1
                     log.debug(f"Skipped (no valid credential pattern): {line_stripped}")
                     continue
 
-                email, password, url_part = parsed
-                cred_key = f"{email}:{password}"
+                extraction_stats['candidates_extracted'] += len(candidates)
+                accepted_for_line = 0
 
-                if cred_key in seen:
-                    log.debug(f"Duplicate skipped: {cred_key}")
-                    continue
+                for candidate in candidates:
+                    if candidate['confidence'] < EXTRACTION_MODES[args.mode]['min_confidence']:
+                        extraction_stats['low_confidence_skips'] += 1
+                        log.debug(
+                            f"Skipped (low confidence {candidate['confidence']:.2f}): {candidate['canonical']}"
+                        )
+                        continue
 
-                seen.add(cred_key)
+                    if not candidate_mentions_target(candidate, line_stripped, target_context):
+                        extraction_stats['target_skips'] += 1
+                        log.debug(f"Skipped (target mismatch): {candidate['canonical']}")
+                        continue
 
-                new_creds.append({
-                    'url': url_part,
-                    'email': email,
-                    'password': password,
-                    'source': leak.get('name', 'unknown'),
-                    'raw': line_stripped,
-                })
-                log.info(f"Found: {line_stripped}")
+                    cred_key = candidate['dedup_key']
+
+                    if cred_key in seen:
+                        extraction_stats['duplicates'] += 1
+                        log.debug(f"Duplicate skipped: {candidate['canonical']}")
+                        continue
+
+                    seen.add(cred_key)
+
+                    identity = candidate['identity']
+                    email_value = identity if '@' in identity else ''
+
+                    new_creds.append({
+                        'url': candidate['url'],
+                        'identity': identity,
+                        'email': email_value,
+                        'password': candidate['password'],
+                        'source': leak.get('name', 'unknown'),
+                        'raw_line': line_stripped,
+                        'raw': line_stripped,
+                        'canonical': candidate['canonical'],
+                        'confidence': candidate['confidence'],
+                        'pattern': candidate['pattern'],
+                    })
+                    extraction_stats['new_credentials'] += 1
+                    accepted_for_line += 1
+                    log.info(
+                        f"Found ({candidate['pattern']} {candidate['confidence']:.2f}): "
+                        f"{candidate['canonical']}"
+                    )
+
+                if accepted_for_line > 1:
+                    extraction_stats['multi_candidate_lines'] += 1
 
         except Exception as e:
             log.error(f"Error processing leak {leak.get('name', 'unknown')}: {e}")
@@ -273,20 +436,49 @@ try:
         elif args.format == 'csv':
             file_exists = os.path.exists(output_file) and os.path.getsize(output_file) > 0
             with open(output_file, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=['url', 'email', 'password', 'source'])
+                fieldnames = [
+                    'url',
+                    'identity',
+                    'email',
+                    'password',
+                    'source',
+                    'confidence',
+                    'pattern',
+                    'canonical',
+                    'raw_line',
+                ]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if not file_exists:
                     writer.writeheader()
                 for cred in new_creds:
-                    writer.writerow({k: cred[k] for k in ['url', 'email', 'password', 'source']})
+                    writer.writerow({key: cred.get(key, '') for key in fieldnames})
 
         else:  # txt
             with open(output_file, 'a') as f:
                 for cred in new_creds:
-                    f.write(f"{cred['raw']}\n")
+                    f.write(f"{cred['canonical']}\n")
 
         log.info(f"Wrote {len(new_creds)} new credentials to: {output_file}")
 
+    if args.safe_share:
+        try:
+            safe_output_file = resolve_safe_output_path(output_file, args.safe_output)
+            safe_count = write_safe_share_file(output_file, args.format, safe_output_file)
+            log.info(f"Wrote {safe_count} anonymized credentials to safe-share file: {safe_output_file}")
+        except Exception as e:
+            log.error(f"Failed to create safe-share output: {e}")
+
     log.info(f"Total unique credentials (all runs): {len(seen)}")
+    log.info(
+        "Extraction stats (%(mode)s) - scanned: %(lines_scanned)s, candidates: %(candidates_extracted)s, "
+        "pattern_skips: %(pattern_skips)s, low_conf: %(low_confidence_skips)s, "
+        "target_skips: %(target_skips)s, multi_lines: %(multi_candidate_lines)s, "
+        "duplicates: %(duplicates)s, new: %(new_credentials)s",
+        {
+            **extraction_stats,
+            'mode': args.mode,
+        },
+    )
 
 except FileNotFoundError:
     log.error(f"Cannot create/write to output file: {output_file}")

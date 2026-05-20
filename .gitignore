@@ -181,7 +181,10 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-custom/
+custom/*
+!custom/parser.py
+!custom/credential_extractor.py
+!custom/__init__.py
 
 # PyCharm
 #   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
