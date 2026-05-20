@@ -80,8 +80,14 @@ def canonicalize_url_part(url_part):
     if not url_part:
         return ''
 
-    parsed = urlparse(url_part if '://' in url_part else f'http://{url_part}')
-    host = parsed.hostname
+    parse_target = url_part if '://' in url_part else f'http://{url_part}'
+    try:
+        parsed = urlparse(parse_target)
+        host = parsed.hostname
+    except ValueError:
+        # Broken URL fragments (commonly malformed IPv6 hosts) should not abort extraction.
+        return url_part
+
     if host:
         decoded_host = decode_punycode_host(host)
         path = parsed.path or ''

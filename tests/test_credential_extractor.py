@@ -90,6 +90,17 @@ class CredentialExtractorTests(unittest.TestCase):
         terms = build_search_terms('info@example.it', include_email_pattern=False, person_name=None)
         self.assertEqual(terms, ['info@example.it'])
 
+    def test_malformed_ipv6_url_in_kv_does_not_raise(self):
+        line = 'url=http://[2001:db8::1 user=admin password=Pass123!'
+
+        try:
+            candidates = extract_credentials_from_line(line, mode='aggressive')
+        except ValueError as exc:
+            self.fail(f'extract_credentials_from_line raised ValueError: {exc}')
+
+        self.assertTrue(candidates)
+        self.assertTrue(any(item['url'].startswith('http://[2001') for item in candidates))
+
     def test_person_email_matching_is_not_domain_only(self):
         context = build_person_email_context('andre.ferrario@icloud.com')
 
