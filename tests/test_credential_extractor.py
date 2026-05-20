@@ -2,9 +2,13 @@ import unittest
 
 from custom.credential_extractor import (
     EXTRACTION_MODES,
+    build_person_email_context,
+    build_search_terms,
     build_target_context,
+    candidate_mentions_person_email,
     candidate_mentions_target,
     extract_credentials_from_line,
+    is_email_target,
 )
 
 
@@ -68,6 +72,37 @@ class CredentialExtractorTests(unittest.TestCase):
 
         self.assertEqual(strict_candidates, [])
         self.assertTrue(aggressive_candidates)
+
+    def test_email_target_search_terms_include_person_variants(self):
+        terms = build_search_terms(
+            'john.doe@example.com',
+            include_email_pattern=True,
+            person_name='John Doe',
+        )
+        lowered_terms = {item.lower() for item in terms}
+
+        self.assertIn('john.doe@example.com', lowered_terms)
+        self.assertIn('"john.doe@example.com"', lowered_terms)
+        self.assertIn('@example.com', lowered_terms)
+        self.assertIn('john doe', lowered_terms)
+
+    def test_person_email_matching_is_not_domain_only(self):
+        context = build_person_email_context('john.doe@example.com')
+
+        non_matching_candidate = {
+            'identity': 'random.user@example.com',
+            'url': 'example.com/login',
+            'canonical': 'example.com/login:random.user@example.com:Pass123!',
+        }
+        matching_candidate = {
+            'identity': 'john.doe@example.com',
+            'url': 'example.com/login',
+            'canonical': 'example.com/login:john.doe@example.com:Pass123!',
+        }
+
+        self.assertTrue(is_email_target('john.doe@example.com'))
+        self.assertFalse(candidate_mentions_person_email(non_matching_candidate, non_matching_candidate['canonical'], context))
+        self.assertTrue(candidate_mentions_person_email(matching_candidate, matching_candidate['canonical'], context))
 
 
 if __name__ == '__main__':

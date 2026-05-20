@@ -33,6 +33,19 @@ KV_PAIR_PATTERN = re.compile(
     r'(?P<value>"[^"]*"|\'[^\']*\'|.*?)(?=(?:\s+(?:url|site|host|domain|user|username|login|email|pass|password|pwd)\s*[:=])|$)',
     re.IGNORECASE,
 )
+EMAIL_TARGET_PATTERN = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+NAME_TOKEN_SPLIT_PATTERN = re.compile(r'[^a-z0-9]+')
+
+
+def _add_unique(target_list, seen, value):
+    value = value.strip()
+    if not value:
+        return
+    lowered = value.lower()
+    if lowered in seen:
+        return
+    seen.add(lowered)
+    target_list.append(value)
 
 
 def sanitize_value(value):
@@ -87,6 +100,75 @@ def normalize_for_matching(value):
     return re.sub(r'[^a-z0-9]', '', value)
 
 
+def is_email_target(target):
+    normalized = normalize_obfuscations(target.strip().lower())
+    return bool(EMAIL_TARGET_PATTERN.match(normalized))
+
+
+def _derive_person_name_variants(email, person_name=None):
+    variants = []
+    seen = set()
+
+    email = normalize_obfuscations(email.strip().lower())
+    local_part, _, _ = email.partition('@')
+    local_tokens = [token for token in re.split(r'[._\-]+', local_part) if token]
+
+    if local_part:
+        _add_unique(variants, seen, local_part)
+
+    if len(local_tokens) >= 2:
+        _add_unique(variants, seen, f"{local_tokens[0]} {local_tokens[-1]}")
+        _add_unique(variants, seen, ''.join(local_tokens))
+
+    if person_name:
+        clean_name = ' '.join(person_name.strip().split())
+        if clean_name:
+            _add_unique(variants, seen, clean_name)
+            _add_unique(variants, seen, f'"{clean_name}"')
+
+            name_tokens = [
+                token
+                for token in NAME_TOKEN_SPLIT_PATTERN.split(clean_name.lower())
+                if token
+            ]
+            if len(name_tokens) >= 2:
+                _add_unique(variants, seen, ''.join(name_tokens))
+
+    return variants
+
+
+def build_search_terms(target, include_email_pattern=False, person_name=None):
+    """Build IntelX search terms for domain/email/person targeting."""
+    target_normalized = normalize_obfuscations(target.strip())
+    terms = []
+    seen = set()
+
+    _add_unique(terms, seen, target_normalized)
+
+    if is_email_target(target_normalized):
+        email_value = target_normalized.lower()
+        local_part, _, domain = email_value.partition('@')
+
+        _add_unique(terms, seen, f'"{email_value}"')
+        _add_unique(terms, seen, email_value.replace('@', ' [at] '))
+        _add_unique(terms, seen, email_value.replace('@', '(at)'))
+        _add_unique(terms, seen, local_part)
+
+        for variant in _derive_person_name_variants(email_value, person_name=person_name):
+            _add_unique(terms, seen, variant)
+
+        if include_email_pattern and domain:
+            _add_unique(terms, seen, f"@{domain}")
+
+        return terms
+
+    if include_email_pattern:
+        email_target = f"@{target_normalized}" if not target_normalized.startswith('@') else target_normalized
+        _add_unique(terms, seen, email_target)
+
+    return terms
+
+
 def build_target_context(target):
     target_plain = target.lstrip('@').strip().lower()
     variants = {target_plain, normalize_obfuscations(target_plain).lower()}
@@ -102,6 +184,23 @@ def build_target_context(target):
         'target_plain': target_plain,
         'variants': {item for item in variants if item},
         'normalized_variants': normalized_variants,
+    }
+
+
+def build_person_email_context(email, person_name=None):
+    """Build strict context for matching a specific person email target."""
+    normalized_email = normalize_obfuscations(email.strip().lower())
+    local_part, _, domain = normalized_email.partition('@')
+    name_variants = _derive_person_name_variants(normalized_email, person_name=person_name)
+
+    return {
+        'email': normalized_email,
+        'email_normalized': normalize_for_matching(normalized_email),
+        'local_part': local_part,
+        'local_normalized': normalize_for_matching(local_part),
+        'domain': domain,
+        'domain_normalized': normalize_for_matching(domain),
+        'name_variants': name_variants,
     }
 
 
@@ -168,6 +267,42 @@ def candidate_mentions_target(candidate, raw_line, target_context):
         for normalized_variant in target_context['normalized_variants']:
             if normalized_variant and normalized_variant in normalized:
                 return True
+    return False
+
+
+def candidate_mentions_person_email(candidate, raw_line, person_context):
+    """Match candidate against a person email target without falling back to domain-only hits."""
+    texts = [
+        raw_line,
+        candidate.get('identity', ''),
+        candidate.get('url', ''),
+        candidate.get('canonical', ''),
+    ]
+
+    local_norm = person_context.get('local_normalized', '')
+    domain_norm = person_context.get('domain_normalized', '')
+    email_norm = person_context.get('email_normalized', '')
+
+    for text in texts:
+        if not text:
+            continue
+        lowered = normalize_obfuscations(text).lower()
+        normalized = normalize_for_matching(text)
+
+        # Strong match on the exact email (supports obfuscated variants via normalization)
+        if email_norm and email_norm in normalized:
+            return True
+
+        # Fallback: local + domain co-occurrence in the same line/candidate context
+        if local_norm and domain_norm and local_norm in normalized and domain_norm in normalized:
+            if '@' in lowered or 'email' in lowered or 'user' in lowered or 'login' in lowered:
+                return True
+
+        # If a person name was supplied, require name + domain proximity in same text
+        for name_variant in person_context.get('name_variants', []):
+            if name_variant and name_variant.lower() in lowered and domain_norm and domain_norm in normalized:
+                return True
+
     return False
 
 

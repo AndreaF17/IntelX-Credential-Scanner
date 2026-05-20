@@ -16,9 +16,13 @@ import importlib
 from custom.credential_extractor import (
     DEFAULT_MODE,
     EXTRACTION_MODES,
+    build_person_email_context,
+    build_search_terms,
     build_target_context,
+    candidate_mentions_person_email,
     candidate_mentions_target,
     extract_credentials_from_line,
+    is_email_target,
 )
 from custom.parser import anonymize_password, parse_line_candidates
 
@@ -117,6 +121,9 @@ def write_safe_share_file(main_output_path, output_format, safe_output_path):
             'Source': cred.get('source', ''),
         })
 
+    if not safe_rows:
+        return 0
+
     safe_dir = os.path.dirname(safe_output_path)
     if safe_dir:
         os.makedirs(safe_dir, exist_ok=True)
@@ -131,7 +138,7 @@ def write_safe_share_file(main_output_path, output_format, safe_output_path):
 
 # ── Argument parser ─────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description='Search for leaked credentials')
-parser.add_argument('-t', '--target', type=str, help='The target domain to search for', required=True)
+parser.add_argument('-t', '--target', type=str, help='Target to search (domain or email)', required=True)
 parser.add_argument('-m', '--maxresults', type=int, help='Maximum number of results to return', default=100)
 parser.add_argument('-k', '--apikey', type=str, help='IntelX API key', required=False)
 parser.add_argument('-o', '--output', type=str, help='Output file to save the results', default=None)
@@ -139,6 +146,12 @@ parser.add_argument('-f', '--format', type=str, choices=['txt', 'json', 'csv'], 
 parser.add_argument('-r', '--range', type=int, help='Search range in months', default=6)
 parser.add_argument('-d', '--debug', action='store_true', help='Enable DEBUG logging (default: INFO)')
 parser.add_argument('-e', '--email', action='store_true', help='Also search for @domain pattern')
+parser.add_argument(
+    '--person-name',
+    type=str,
+    default=None,
+    help='Optional full name to enrich person-email search terms',
+)
 parser.add_argument(
     '--safe-share',
     action='store_true',
@@ -217,15 +230,20 @@ log.info(f"Searching from {six_months_ago_formatted} to {today_formatted}")
 
 # ── IntelX search ────────────────────────────────────────────────────────────
 target = args.target
+target_is_email = is_email_target(target)
 target_context = build_target_context(target)
+person_context = build_person_email_context(target, person_name=args.person_name) if target_is_email else None
+
+if args.person_name and not target_is_email:
+    log.warning("--person-name is most useful with an email target and will be ignored for domain targets")
 
 BUCKETS = ['leaks.private', 'leaks.public', 'leaks.private.li', 'pastes']
 
-search_terms = [target]
-if args.email:
-    email_target = f"@{target}" if not target.startswith("@") else target
-    search_terms.append(email_target)
-    log.info(f"Email search enabled: also searching for '{email_target}'")
+search_terms = build_search_terms(target, include_email_pattern=args.email, person_name=args.person_name)
+if target_is_email:
+    log.info(f"Person-email mode enabled. Generated {len(search_terms)} search terms for '{target}'.")
+elif args.email:
+    log.info("Email search enabled: added @domain pattern search term")
 
 try:
     if INTELX_CLIENT is None:
@@ -241,11 +259,26 @@ try:
         for bucket in BUCKETS:
             log.debug(f"Searching bucket '{bucket}' for '{term}'...")
             try:
-                records = ix.search(term,
-                                    maxresults=args.maxresults,
-                                    buckets=[bucket],
-                                    datefrom=six_months_ago_formatted,
-                                    dateto=today_formatted).get('records', [])
+                try:
+                    response = ix.search(term,
+                                         maxresults=args.maxresults,
+                                         buckets=[bucket],
+                                         datefrom=six_months_ago_formatted,
+                                         dateto=today_formatted)
+                except TypeError as e:
+                    # intelxapi can raise this when API returns {'records': None}
+                    if "'NoneType' object is not iterable" in str(e):
+                        log.debug(
+                            f"IntelX SDK returned null records for term '{term}' in bucket '{bucket}', "
+                            "treating as empty result"
+                        )
+                        response = {'records': []}
+                    else:
+                        raise
+
+                records = response.get('records') if isinstance(response, dict) else []
+                if not records:
+                    records = []
                 # deduplicate across buckets/terms by storageid
                 for r in records:
                     sid = r.get('storageid')
@@ -369,7 +402,12 @@ try:
                         )
                         continue
 
-                    if not candidate_mentions_target(candidate, line_stripped, target_context):
+                    if person_context:
+                        target_match = candidate_mentions_person_email(candidate, line_stripped, person_context)
+                    else:
+                        target_match = candidate_mentions_target(candidate, line_stripped, target_context)
+
+                    if not target_match:
                         extraction_stats['target_skips'] += 1
                         log.debug(f"Skipped (target mismatch): {candidate['canonical']}")
                         continue
@@ -463,8 +501,15 @@ try:
     if args.safe_share:
         try:
             safe_output_file = resolve_safe_output_path(output_file, args.safe_output)
-            safe_count = write_safe_share_file(output_file, args.format, safe_output_file)
-            log.info(f"Wrote {safe_count} anonymized credentials to safe-share file: {safe_output_file}")
+            if os.path.exists(output_file):
+                safe_count = write_safe_share_file(output_file, args.format, safe_output_file)
+            else:
+                safe_count = 0
+
+            if safe_count > 0:
+                log.info(f"Wrote {safe_count} anonymized credentials to safe-share file: {safe_output_file}")
+            else:
+                log.info("Safe-share skipped: 0 anonymized credentials")
         except Exception as e:
             log.error(f"Failed to create safe-share output: {e}")
 
