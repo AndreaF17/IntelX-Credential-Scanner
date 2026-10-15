@@ -269,6 +269,7 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
                     'identity': entry.get('identity') or entry.get('email', ''),
                     'password': entry.get('password', ''),
                     'source': entry.get('source', ''),
+                    'date': entry.get('date', ''),
                 }
 
     elif output_format == 'csv':
@@ -280,17 +281,26 @@ def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -
                     'identity': row.get('identity') or row.get('email', ''),
                     'password': row.get('password', ''),
                     'source': row.get('source', ''),
+                    'date': row.get('date', ''),
                 }
 
     else:  # txt
         with open(main_output_path, 'r') as f:
             for line in f:
-                for target, user, password in parse_line_candidates(line):
+                # Lines are "<date> | <canonical>"; split the date prefix back off.
+                date = ''
+                body = line
+                if ' | ' in line:
+                    prefix, _, body = line.partition(' | ')
+                    prefix = prefix.strip()
+                    date = '' if prefix == 'unknown' else prefix
+                for target, user, password in parse_line_candidates(body):
                     yield {
                         'url': target,
                         'identity': user,
                         'password': password,
                         'source': '',
+                        'date': date,
                     }
 
 
@@ -314,6 +324,7 @@ def write_safe_share_file(main_output_path: str, output_format: str, safe_output
             'TARGET': cred.get('url', ''),
             'User': identity,
             'Password': anonymize_password(password),
+            'Date': cred.get('date', ''),
             'Source': cred.get('source', ''),
         })
 
@@ -325,7 +336,7 @@ def write_safe_share_file(main_output_path: str, output_format: str, safe_output
         os.makedirs(safe_dir, exist_ok=True)
 
     with open(safe_output_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['TARGET', 'User', 'Password', 'Source'], delimiter=';')
+        writer = csv.DictWriter(f, fieldnames=['TARGET', 'User', 'Password', 'Date', 'Source'], delimiter=';')
         writer.writeheader()
         writer.writerows(safe_rows)
 
@@ -569,6 +580,19 @@ class ProgressReporter:
 
 
 # ── Process leaks ────────────────────────────────────────────────────────────
+def _leak_date(leak: Dict[str, Any]) -> str:
+    """Return the leak's disclosure date as ``YYYY-MM-DD`` (or ``'unknown'``).
+
+    IntelX records carry ``date`` (the item's own date) and ``added`` (when it
+    was indexed); we prefer the former and normalize ISO/space timestamps to
+    just the day so the value is readable in the output.
+    """
+    raw = str(leak.get('date') or leak.get('added') or '').strip()
+    if not raw:
+        return 'unknown'
+    return raw.replace('T', ' ')[:10]
+
+
 def _new_stats() -> Dict[str, int]:
     """Return a zeroed extraction-stats dict."""
     return {
@@ -661,6 +685,7 @@ def _process_contents(
                 'email': email_value,
                 'password': candidate['password'],
                 'source': leak.get('name', 'unknown'),
+                'date': _leak_date(leak),
                 'raw_line': line_stripped,
                 'raw': line_stripped,
                 'canonical': candidate['canonical'],
@@ -825,6 +850,7 @@ CSV_FIELDNAMES = [
     'identity',
     'email',
     'password',
+    'date',
     'source',
     'confidence',
     'pattern',
@@ -872,7 +898,9 @@ def write_txt_output(new_creds: List[Dict[str, Any]], output_file: str, log: log
     os.makedirs(directory, exist_ok=True)
     with open(output_file, 'a') as f:
         for cred in new_creds:
-            f.write(f"{cred['canonical']}\n")
+            # "<date> | <canonical>" — the leading ' | ' is a chunk boundary for the
+            # extractor, so the line still re-parses cleanly on resume/safe-share.
+            f.write(f"{cred.get('date') or 'unknown'} | {cred['canonical']}\n")
     return len(new_creds)
 
 
