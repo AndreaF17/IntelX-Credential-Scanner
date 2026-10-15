@@ -34,14 +34,17 @@ class FakeIntelX:
         return {'records': []}
 
 
-def _make_leak(storageid, name='leak'):
-    return {
+def _make_leak(storageid, name='leak', date=None):
+    leak = {
         'storageid': storageid,
         'type': 0,
         'media': 0,
         'bucket': 'leaks.public',
         'name': name,
     }
+    if date is not None:
+        leak['date'] = date
+    return leak
 
 
 class ResolveOutputPathTests(unittest.TestCase):
@@ -202,13 +205,30 @@ class WriteTxtOutputTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def test_appends_canonical(self):
+    def test_appends_canonical_with_date_prefix(self):
         path = os.path.join(self.tmp.name, 'out.txt')
-        main.write_txt_output([{'canonical': 'x.com:a:p1'}], path, self.log)
-        main.write_txt_output([{'canonical': 'y.com:b:p2'}], path, self.log)
+        main.write_txt_output([{'canonical': 'x.com:a:p1', 'date': '2024-05-01'}], path, self.log)
+        main.write_txt_output([{'canonical': 'y.com:b:p2'}], path, self.log)  # missing date
         with open(path) as f:
             lines = [ln.strip() for ln in f if ln.strip()]
-        self.assertEqual(lines, ['x.com:a:p1', 'y.com:b:p2'])
+        self.assertEqual(lines, ['2024-05-01 | x.com:a:p1', 'unknown | y.com:b:p2'])
+
+    def test_txt_line_still_round_trips_through_extractor(self):
+        # The date prefix must not stop the credential being re-parsed (resume/safe-share).
+        from custom.credential_extractor import extract_credentials_from_line
+        line = '2024-05-01 | www.gamelife.it:alice@example.com:Str0ngPass9'
+        cands = extract_credentials_from_line(line, mode='aggressive')
+        self.assertTrue(any(c['identity'] == 'alice@example.com' and c['password'] == 'Str0ngPass9'
+                            for c in cands))
+
+
+class LeakDateTests(unittest.TestCase):
+    def test_prefers_date_then_added_then_unknown(self):
+        self.assertEqual(main._leak_date({'date': '2024-05-01 00:00:00'}), '2024-05-01')
+        self.assertEqual(main._leak_date({'date': '2024-05-01T12:30:00'}), '2024-05-01')
+        self.assertEqual(main._leak_date({'added': '2023-01-02T00:00:00'}), '2023-01-02')
+        self.assertEqual(main._leak_date({}), 'unknown')
+        self.assertEqual(main._leak_date({'date': ''}), 'unknown')
 
 
 class FileViewRetryTests(unittest.TestCase):
@@ -325,6 +345,13 @@ class ProcessLeaksTests(unittest.TestCase):
         self.assertEqual(stats['new_credentials'], 1)
         self.assertEqual(stats['duplicates'], 1)
 
+    def test_credential_carries_leak_date(self):
+        contents = {'s1': 'example.com:admin:StrongPass1'}
+        leaks = [_make_leak('s1', date='2024-05-01T00:00:00')]
+        new_creds, _ = self._run(leaks, contents)
+        self.assertEqual(len(new_creds), 1)
+        self.assertEqual(new_creds[0]['date'], '2024-05-01')
+
     def test_concurrent_matches_sequential_result_set(self):
         contents = {
             's1': 'example.com:admin:StrongPass1',
@@ -384,6 +411,35 @@ class WriteSafeShareTests(unittest.TestCase):
         self.assertEqual(rows[0]['User'], 'admin')
         self.assertNotEqual(rows[0]['Password'], 'Secret123')  # anonymized
         self.assertTrue(rows[0]['Password'].startswith('S'))
+
+    def test_safe_share_carries_date_column(self):
+        src = os.path.join(self.tmp.name, 'creds.json')
+        with open(src, 'w') as f:
+            json.dump([{'url': 'x.com', 'identity': 'admin', 'password': 'Secret123',
+                        'source': 'leakA', 'date': '2024-05-01'}], f)
+        dest = os.path.join(self.tmp.name, 'safe.csv')
+        main.write_safe_share_file(src, 'json', dest)
+        with open(dest) as f:
+            rows = list(csv.DictReader(f, delimiter=';'))
+        self.assertEqual(rows[0]['Date'], '2024-05-01')
+
+
+class CsvDateColumnTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log = _silent_logger()
+
+    def test_csv_output_has_date_column(self):
+        path = os.path.join(self.tmp.name, 'out.csv')
+        main.write_csv_output(
+            [{'identity': 'a@x.com', 'password': 'p1', 'url': 'x.com', 'date': '2024-05-01'}],
+            path, self.log,
+        )
+        with open(path) as f:
+            rows = list(csv.DictReader(f))
+        self.assertIn('date', rows[0])
+        self.assertEqual(rows[0]['date'], '2024-05-01')
 
 
 if __name__ == '__main__':
