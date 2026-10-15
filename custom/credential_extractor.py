@@ -36,6 +36,59 @@ KV_PAIR_PATTERN = re.compile(
 EMAIL_TARGET_PATTERN = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 NAME_TOKEN_SPLIT_PATTERN = re.compile(r'[^a-z0-9]+')
 
+# ── False-positive filters ───────────────────────────────────────────────────
+# IntelX returns far more than combolists for a domain target: ZoomInfo / LinkedIn
+# profiles and Dynamics-CRM / OData exports are tabular business data whose cells,
+# split on ':', trivially matched the old loose host/triplet heuristics. The
+# predicates below reject the three dominant noise shapes — dates/numbers, CRM
+# metadata field names, and placeholder values — without touching real creds.
+
+# Matches a hostname ending in a plausible alphabetic TLD (2-24 letters). Used to
+# tell a real host (recordati.it) from numeric/date junk (2292377000.00, 7/1/2016).
+_HOST_TLD_PATTERN = re.compile(r'\.[A-Za-z]{2,24}$')
+# d/d/d or d-d-d style dates (7/26/2016, 2021-05-14) that show up as CRM cells.
+_DATE_PATTERN = re.compile(r'^\d{1,4}[/.\-]\d{1,2}[/.\-]\d{1,4}$')
+# Dotted-quad IPv4 address (213.61.202.248), common in DNS/WHOIS dumps.
+_IPV4_PATTERN = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+# Values that are never a real identity or password.
+_PLACEHOLDER_VALUES = frozenset({
+    'null', 'none', 'nil', 'n/a', 'na', 'undefined', 'true', 'false', '-', '--',
+})
+# Substrings that mark a token as CRM/OData/export metadata rather than a credential.
+_METADATA_SUBSTRINGS = (
+    'odata.', '@odata', '.odata', 'microsoft.dynamics', 'dynamics.crm',
+    'lookuplogicalname', 'formattedvalue', 'systemuser', '_value@', 'msdyn_',
+    'msdip_', 'adx_', 'navigationproperty',
+)
+
+
+def _is_plausible_host(value):
+    """True when ``value`` looks like a real host/URL, not a date, number or money figure."""
+    value = sanitize_value(value)
+    if not value:
+        return False
+    if '://' in value:
+        return True
+    host = value.split('/', 1)[0].split('?', 1)[0]
+    if not re.search(r'[A-Za-z]', host):
+        return False  # purely numeric/date (7/1/2016, 2292377000.00, 00.000)
+    return bool(_HOST_TLD_PATTERN.search(host))
+
+
+def _contains_metadata_token(*values):
+    blob = ' '.join(value for value in values if value).lower()
+    return any(token in blob for token in _METADATA_SUBSTRINGS)
+
+
+def _is_placeholder(value):
+    return sanitize_value(value).lower() in _PLACEHOLDER_VALUES
+
+
+def _looks_like_locator(value):
+    """True when ``value`` is a hostname/URL or IPv4 address (a network locator)."""
+    value = sanitize_value(value)
+    return _is_plausible_host(value) or bool(_IPV4_PATTERN.match(value))
+
 
 def _add_unique(target_list, seen, value):
     value = value.strip()
@@ -144,15 +197,25 @@ def _derive_person_name_variants(email, person_name=None, include_local_from_ema
     return variants
 
 
-def build_search_terms(target, include_email_pattern=False, person_name=None):
-    """Build IntelX search terms for domain/email/person targeting."""
+def build_search_terms(target, include_email_pattern=False, person_name=None, company_wide=False):
+    """Build IntelX search terms for domain/email/person targeting.
+
+    Email target: the exact email first, plus optional person-name variants and
+    (with ``include_email_pattern``) the ``@domain`` pattern.
+
+    Domain target: the ``@domain`` *email selector* by default. It matches leaked
+    account rows (``alice@domain:password``) while skipping the company-mention
+    documents — ZoomInfo/LinkedIn profiles, Dynamics-CRM/OData exports — that a
+    bare-domain search drags in. ``company_wide`` additionally searches the bare
+    domain to catch host-form creds (``domain:user:password``); the extractor's
+    filters discard the extra business-data noise that sweep surfaces.
+    """
     target_normalized = normalize_obfuscations(target.strip())
     terms = []
     seen = set()
 
-    _add_unique(terms, seen, target_normalized)
-
     if is_email_target(target_normalized):
+        _add_unique(terms, seen, target_normalized)
         email_value = target_normalized.lower()
         _, _, domain = email_value.partition('@')
 
@@ -170,9 +233,11 @@ def build_search_terms(target, include_email_pattern=False, person_name=None):
 
         return terms
 
-    if include_email_pattern:
-        email_target = f"@{target_normalized}" if not target_normalized.startswith('@') else target_normalized
-        _add_unique(terms, seen, email_target)
+    # Domain target: email selector by default, bare domain only when asked.
+    domain_plain = target_normalized.lstrip('@')
+    _add_unique(terms, seen, f"@{domain_plain}")
+    if company_wide:
+        _add_unique(terms, seen, domain_plain)
 
     return terms
 
@@ -217,13 +282,20 @@ def build_person_email_context(email, person_name=None):
 
 
 def looks_like_url_part(value):
-    value = sanitize_value(value)
-    return bool(value) and ('.' in value or '/' in value)
+    # A credential anchor must resemble a real host/URL — a bare dot or slash
+    # (dates, money figures, numeric IDs) is not enough.
+    return _is_plausible_host(value)
 
 
 def looks_like_identity(value):
     value = sanitize_value(value)
-    return bool(value) and ':' not in value and '\n' not in value
+    if not value or ':' in value or '\n' in value:
+        return False
+    if any(ch.isspace() for ch in value):
+        return False  # "Investment Advisor", "Default Value" are CRM columns, not users
+    if _DATE_PATTERN.match(value) or _is_placeholder(value):
+        return False
+    return True
 
 
 def looks_like_password(value, mode):
@@ -329,6 +401,31 @@ def _build_candidate(candidates, seen, identity, password, url_part, pattern, ra
 
     if not identity or not password:
         return
+
+    # Reject CRM/OData export metadata regardless of which pattern matched it.
+    if _contains_metadata_token(identity, url_part, password):
+        return
+
+    # The identity and password must be plausible credential values.
+    identity_is_email = '@' in identity
+    if not identity_is_email and not looks_like_identity(identity):
+        return
+    if _is_placeholder(password) or _DATE_PATTERN.match(password):
+        return
+
+    # DNS/WHOIS rows and contact dumps produce locator:locator:locator chains. A
+    # real password is never a hostname/IP, so drop rows where both the identity
+    # and the password are network locators (host-as-identity creds still pass,
+    # because their password is not a locator).
+    if _looks_like_locator(password) and (identity_is_email or _looks_like_locator(identity)):
+        return
+
+    # Require a trustworthy anchor: either a real host/URL or an email identity.
+    # Without one, a candidate is almost always noise from tabular business data.
+    if not _is_plausible_host(url_part):
+        url_part = ''
+        if not identity_is_email:
+            return
 
     dedup_key = f"{identity.lower()}:{password}"
     canonical = f"{url_part}:{identity}:{password}" if url_part else f"{identity}:{password}"
