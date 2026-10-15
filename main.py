@@ -1,17 +1,33 @@
 #!/usr/bin/env python3
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
-import re
+"""IntelX credential scanner.
+
+Searches the Intelligence X API for leaked credentials matching a target
+(domain or email), extracts candidate credentials from the matched leak
+files, and writes deduplicated results to disk (txt/json/csv) with an
+optional sanitized "safe-share" CSV.
+
+All logic lives in importable, unit-testable functions; the CLI entry
+point is ``main()``, guarded by ``if __name__ == '__main__'``.
+"""
+from __future__ import annotations
+
 import argparse
-import logging
-import colorlog
-from dotenv import load_dotenv
-import os
-import sys
-import time
-import json
 import csv
 import importlib
+import json
+import logging
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+
+import colorlog
+from dateutil.relativedelta import relativedelta
+from dotenv import load_dotenv
 
 from custom.credential_extractor import (
     DEFAULT_MODE,
@@ -24,11 +40,62 @@ from custom.credential_extractor import (
     extract_credentials_from_line,
     is_email_target,
 )
+from custom.confidence_model import DEFAULT_MODEL_PATH, ConfidenceModel
 from custom.parser import anonymize_password, parse_line_candidates
 
+# Optional progress bar; the scanner degrades gracefully without it.
+try:  # pragma: no cover - exercised indirectly
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover
+    _tqdm = None
 
-def load_intelx_client():
-    """Load IntelX client constructor from available SDK package names."""
+
+# ── Configuration ────────────────────────────────────────────────────────────
+# Buckets searched on IntelX, in priority order.
+BUCKETS: Tuple[str, ...] = ('leaks.private', 'leaks.public', 'leaks.private.li', 'pastes')
+
+# Maximum retries for FILE_VIEW API calls.
+MAX_RETRIES: int = 3
+# Seconds before the first retry; doubles after each attempt (exponential backoff).
+RETRY_DELAY: float = 2.0
+# Default seconds between FILE_VIEW calls (rate limiting). Overridable with --delay.
+REQUEST_DELAY: float = 0.5
+# Default number of concurrent FILE_VIEW workers. 1 preserves legacy sequential behavior.
+DEFAULT_WORKERS: int = 1
+# Default search range in months.
+DEFAULT_RANGE_MONTHS: int = 6
+# Default maximum results requested PER (search term, bucket) pair. IntelX stops
+# at this cap, so a low value silently truncates results for large domains; raise
+# it (at the cost of more rate-limited FILE_VIEW fetches) when coverage matters.
+DEFAULT_MAX_RESULTS: int = 500
+
+# Per-mode minimum confidence thresholds live in credential_extractor.EXTRACTION_MODES;
+# they are the single source of truth for confidence defaults (see --mode).
+
+
+@dataclass(frozen=True)
+class RetryConfig:
+    """Retry/backoff parameters for FILE_VIEW calls."""
+
+    max_retries: int = MAX_RETRIES
+    retry_delay: float = RETRY_DELAY
+
+
+# Errors we expect from network/IO/SDK calls and can recover from on a per-leak
+# basis. Anything outside this set is genuinely unexpected and is allowed to
+# surface so it isn't silently swallowed.
+try:  # pragma: no cover - import availability is environment dependent
+    import requests as _requests
+
+    _NETWORK_ERRORS: Tuple[type, ...] = (_requests.exceptions.RequestException,)
+except ImportError:  # pragma: no cover
+    _NETWORK_ERRORS = ()
+
+EXPECTED_LEAK_ERRORS: Tuple[type, ...] = (OSError, ValueError, KeyError, TypeError) + _NETWORK_ERRORS
+
+
+def load_intelx_client() -> Optional[Any]:
+    """Load the IntelX client constructor from available SDK package names."""
     for module_name in ('intelxapi', 'intelx'):
         try:
             module = importlib.import_module(module_name)
@@ -41,15 +108,144 @@ def load_intelx_client():
     return None
 
 
-INTELX_CLIENT = load_intelx_client()
+# ── Argument parsing & logging ───────────────────────────────────────────────
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse command-line arguments. ``argv`` defaults to ``sys.argv[1:]``."""
+    parser = argparse.ArgumentParser(description='Search for leaked credentials')
+    parser.add_argument('-t', '--target', type=str, help='Target to search (domain or email)', required=True)
+    parser.add_argument('-m', '--maxresults', type=int, help='Maximum number of results to return', default=DEFAULT_MAX_RESULTS)
+    parser.add_argument('-k', '--apikey', type=str, help='IntelX API key', required=False)
+    parser.add_argument('-o', '--output', type=str, help='Output file to save the results', default=None)
+    parser.add_argument('-f', '--format', type=str, choices=['txt', 'json', 'csv'], help='Output format (txt, json, csv)', default='txt')
+    parser.add_argument('-r', '--range', type=int, help='Search range in months', default=DEFAULT_RANGE_MONTHS)
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable DEBUG logging (default: INFO)')
+    parser.add_argument(
+        '-e', '--email', action='store_true',
+        help='For an email target, also search the @domain pattern. '
+             '(Domain targets already search @domain by default.)',
+    )
+    parser.add_argument(
+        '--company-wide', action='store_true',
+        help='For a domain target, also search the bare domain (not just @domain). '
+             'Catches host-form creds (domain:user:pass) at the cost of fetching '
+             'more business-data documents, which the extractor then filters out.',
+    )
+    parser.add_argument(
+        '--person-name',
+        type=str,
+        default=None,
+        help='Optional full name to enrich person-email search terms',
+    )
+    parser.add_argument(
+        '--safe-share',
+        action='store_true',
+        help='Generate a sanitized CSV file safe to share with external clients',
+    )
+    parser.add_argument(
+        '--safe-output',
+        type=str,
+        default=None,
+        help='Optional safe-share output filename (default: out/<output>-safe.csv)',
+    )
+    parser.add_argument(
+        '--mode',
+        type=str,
+        choices=sorted(EXTRACTION_MODES.keys()),
+        default=DEFAULT_MODE,
+        help='Extraction mode: strict (precision), balanced (default), aggressive (recall)',
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=DEFAULT_WORKERS,
+        help='Number of concurrent FILE_VIEW workers (default: 1, sequential)',
+    )
+    parser.add_argument(
+        '--delay',
+        type=float,
+        default=REQUEST_DELAY,
+        help=f'Seconds between FILE_VIEW calls for rate limiting (default: {REQUEST_DELAY})',
+    )
+    parser.add_argument(
+        '--model',
+        nargs='?',
+        const=DEFAULT_MODEL_PATH,
+        default=None,
+        help='Score candidates with the trained ML confidence model instead of the heuristic. '
+             f'Bare flag uses {DEFAULT_MODEL_PATH}; pass a path to use another. '
+             'The --mode threshold is then applied as a probability cutoff.',
+    )
 
-# Maximum retries for FILE_VIEW API calls
-MAX_RETRIES = 3
-RETRY_DELAY = 2          # seconds, doubles after each retry
-REQUEST_DELAY = 0.5       # seconds between FILE_VIEW calls
+    args = parser.parse_args(argv)
+
+    # --safe-output implies --safe-share.
+    if args.safe_output and not args.safe_share:
+        args.safe_share = True
+
+    if args.workers < 1:
+        parser.error('--workers must be >= 1')
+    if args.delay < 0:
+        parser.error('--delay must be >= 0')
+
+    return args
 
 
-def resolve_safe_output_path(main_output_path, safe_output_arg):
+def configure_logging(debug: bool) -> logging.Logger:
+    """Configure and return the colored module logger."""
+    log_level = logging.DEBUG if debug else logging.INFO
+    logger = colorlog.getLogger('intelx_scanner')
+    logger.setLevel(log_level)
+    # Avoid duplicate handlers if called more than once (e.g. tests).
+    if not logger.handlers:
+        handler = colorlog.StreamHandler()
+        handler.setLevel(log_level)
+        handler.setFormatter(
+            colorlog.ColoredFormatter(
+                '[%(log_color)s%(levelname)s%(reset)s] %(message)s',
+                log_colors={
+                    'DEBUG': 'cyan',
+                    'INFO': 'green',
+                    'WARNING': 'yellow',
+                    'ERROR': 'red',
+                    'CRITICAL': 'red,bg_white',
+                },
+            )
+        )
+        logger.addHandler(handler)
+    else:
+        for handler in logger.handlers:
+            handler.setLevel(log_level)
+    return logger
+
+
+def resolve_api_key(args: argparse.Namespace, log: logging.Logger) -> Optional[str]:
+    """Resolve the IntelX API key from the CLI flag or the environment."""
+    if args.apikey:
+        return args.apikey
+    load_dotenv()
+    api_key = os.getenv('INTELX_API_KEY')
+    if api_key:
+        log.debug("Using API key from environment variable: [hidden]")
+    return api_key
+
+
+def resolve_output_path(args: argparse.Namespace) -> str:
+    """Compute the main output file path inside the ``out/`` directory."""
+    if not args.output:
+        return f"out/{args.target}-creds.{args.format}"
+    return f"out/{args.output}"
+
+
+def compute_date_range(range_months: int, now: Optional[datetime] = None) -> Tuple[str, str]:
+    """Return ``(date_from, date_to)`` strings spanning ``range_months`` back from now."""
+    today = now or datetime.today()
+    start = today - relativedelta(months=range_months)
+    # Cover the whole final day; a 00:00:00 dateto would exclude anything leaked today.
+    return start.strftime("%Y-%m-%d 00:00:00"), today.strftime("%Y-%m-%d 23:59:59")
+
+
+# ── Safe-share output ────────────────────────────────────────────────────────
+def resolve_safe_output_path(main_output_path: str, safe_output_arg: Optional[str]) -> str:
     """Resolve the destination path for the safe-share CSV output."""
     if safe_output_arg:
         if os.path.isabs(safe_output_arg) or safe_output_arg.startswith('out/'):
@@ -60,7 +256,7 @@ def resolve_safe_output_path(main_output_path, safe_output_arg):
     return os.path.join('out', f"{base_name}-safe.csv")
 
 
-def iter_credentials_for_safe_share(main_output_path, output_format):
+def iter_credentials_for_safe_share(main_output_path: str, output_format: str) -> Iterator[Dict[str, str]]:
     """Yield normalized credential dicts from the main output file."""
     if output_format == 'json':
         with open(main_output_path, 'r') as f:
@@ -98,10 +294,10 @@ def iter_credentials_for_safe_share(main_output_path, output_format):
                     }
 
 
-def write_safe_share_file(main_output_path, output_format, safe_output_path):
-    """Create a sanitized CSV suitable for external sharing."""
-    safe_rows = []
-    seen = set()
+def write_safe_share_file(main_output_path: str, output_format: str, safe_output_path: str) -> int:
+    """Create a sanitized CSV suitable for external sharing. Returns rows written."""
+    safe_rows: List[Dict[str, str]] = []
+    seen: Set[str] = set()
 
     for cred in iter_credentials_for_safe_share(main_output_path, output_format):
         identity = (cred.get('identity') or '').strip()
@@ -136,137 +332,34 @@ def write_safe_share_file(main_output_path, output_format, safe_output_path):
     return len(safe_rows)
 
 
-# ── Argument parser ─────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description='Search for leaked credentials')
-parser.add_argument('-t', '--target', type=str, help='Target to search (domain or email)', required=True)
-parser.add_argument('-m', '--maxresults', type=int, help='Maximum number of results to return', default=100)
-parser.add_argument('-k', '--apikey', type=str, help='IntelX API key', required=False)
-parser.add_argument('-o', '--output', type=str, help='Output file to save the results', default=None)
-parser.add_argument('-f', '--format', type=str, choices=['txt', 'json', 'csv'], help='Output format (txt, json, csv)', default='txt')
-parser.add_argument('-r', '--range', type=int, help='Search range in months', default=6)
-parser.add_argument('-d', '--debug', action='store_true', help='Enable DEBUG logging (default: INFO)')
-parser.add_argument('-e', '--email', action='store_true', help='Also search for @domain pattern')
-parser.add_argument(
-    '--person-name',
-    type=str,
-    default=None,
-    help='Optional full name to enrich person-email search terms',
-)
-parser.add_argument(
-    '--safe-share',
-    action='store_true',
-    help='Generate a sanitized CSV file safe to share with external clients',
-)
-parser.add_argument(
-    '--safe-output',
-    type=str,
-    default=None,
-    help='Optional safe-share output filename (default: out/<output>-safe.csv)',
-)
-parser.add_argument(
-    '--mode',
-    type=str,
-    choices=sorted(EXTRACTION_MODES.keys()),
-    default=DEFAULT_MODE,
-    help='Extraction mode: strict (precision), balanced (default), aggressive (recall)',
-)
-
-args = parser.parse_args()
-
-if args.safe_output and not args.safe_share:
-    args.safe_share = True
-
-# Set default output filename based on target if not provided
-if not args.output:
-    args.output = f"out/{args.target}-creds.{args.format}"
-else:
-    # If user provided output, also put it in out/ directory
-    args.output = f"out/{args.output}"
-
-# Configure colored logging
-log_level = logging.DEBUG if args.debug else logging.INFO
-logger = colorlog.getLogger(__name__)
-logger.setLevel(log_level)
-
-handler = colorlog.StreamHandler()
-handler.setLevel(log_level)
-formatter = colorlog.ColoredFormatter(
-    '[%(log_color)s%(levelname)s%(reset)s] %(message)s',
-    log_colors={
-        'DEBUG': 'cyan',
-        'INFO': 'green',
-        'WARNING': 'yellow',
-        'ERROR': 'red',
-        'CRITICAL': 'red,bg_white',
-    }
-)
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-log = logger
-
-
-# ── API key ──────────────────────────────────────────────────────────────────
-try:
-    if not args.apikey:
-        load_dotenv()
-        args.apikey = os.getenv('INTELX_API_KEY')
-        log.debug("Using API key from environment variable: [hidden]")
-    if not args.apikey:
-        log.error("API key is required. Please provide it using -k or set INTELX_API_KEY in your environment variables.")
-        sys.exit(1)
-except Exception as e:
-    log.error(f"Error loading API key: {e}")
-    sys.exit(1)
-
-
-# ── Date range ───────────────────────────────────────────────────────────────
-today = datetime.today()
-six_months_ago = today - relativedelta(months=args.range)
-today_formatted = today.strftime("%Y-%m-%d") + " 00:00:00"
-six_months_ago_formatted = six_months_ago.strftime("%Y-%m-%d") + " 00:00:00"
-
-log.info(f"Searching from {six_months_ago_formatted} to {today_formatted}")
-
-
 # ── IntelX search ────────────────────────────────────────────────────────────
-target = args.target
-target_is_email = is_email_target(target)
-target_context = build_target_context(target)
-person_context = build_person_email_context(target, person_name=args.person_name) if target_is_email else None
+def run_search(
+    ix: Any,
+    search_terms: Iterable[str],
+    buckets: Iterable[str],
+    date_from: str,
+    date_to: str,
+    max_results: int,
+    log: logging.Logger,
+) -> List[Dict[str, Any]]:
+    """Search every (term, bucket) pair and return storageid-deduplicated records."""
+    all_results: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
 
-if args.person_name and not target_is_email:
-    log.warning("--person-name is most useful with an email target and will be ignored for domain targets")
-
-BUCKETS = ['leaks.private', 'leaks.public', 'leaks.private.li', 'pastes']
-
-search_terms = build_search_terms(target, include_email_pattern=args.email, person_name=args.person_name)
-if target_is_email:
-    log.info(f"Person-email mode enabled. Generated {len(search_terms)} search terms for '{target}'.")
-elif args.email:
-    log.info("Email search enabled: added @domain pattern search term")
-
-try:
-    if INTELX_CLIENT is None:
-        log.error("IntelX SDK not installed. Install dependencies with: pip install -r requirements.txt")
-        sys.exit(1)
-
-    ix = INTELX_CLIENT(args.apikey)
-    log.debug(f"IntelX API initialized for target: {target}")
-
-    all_results = []
-    seen_ids = set()
     for term in search_terms:
-        for bucket in BUCKETS:
+        for bucket in buckets:
             log.debug(f"Searching bucket '{bucket}' for '{term}'...")
             try:
                 try:
-                    response = ix.search(term,
-                                         maxresults=args.maxresults,
-                                         buckets=[bucket],
-                                         datefrom=six_months_ago_formatted,
-                                         dateto=today_formatted)
+                    response = ix.search(
+                        term,
+                        maxresults=max_results,
+                        buckets=[bucket],
+                        datefrom=date_from,
+                        dateto=date_to,
+                    )
                 except TypeError as e:
-                    # intelxapi can raise this when API returns {'records': None}
+                    # intelxapi can raise this when the API returns {'records': None}.
                     if "'NoneType' object is not iterable" in str(e):
                         log.debug(
                             f"IntelX SDK returned null records for term '{term}' in bucket '{bucket}', "
@@ -279,36 +372,87 @@ try:
                 records = response.get('records') if isinstance(response, dict) else []
                 if not records:
                     records = []
-                # deduplicate across buckets/terms by storageid
                 for r in records:
                     sid = r.get('storageid')
                     if sid and sid not in seen_ids:
                         seen_ids.add(sid)
                         all_results.append(r)
                 log.debug(f"  -> {len(records)} records from {bucket} for '{term}'")
-            except Exception as e:
+            except EXPECTED_LEAK_ERRORS as e:
                 log.warning(f"Bucket '{bucket}' failed for '{term}': {e}")
                 continue
 
-    results = all_results
-    log.info(f"Found {len(results)} unique results across all buckets")
-except Exception as e:
-    log.error(f"Error searching IntelX API: {e}")
-    sys.exit(1)
+    log.info(f"Found {len(all_results)} unique results across all buckets")
+    return all_results
 
-output_file = args.output
 
-# Create output directory if it doesn't exist
-os.makedirs('out', exist_ok=True)
+def _extract_buckets_from_capabilities(caps: Any) -> List[str]:
+    """Best-effort pull of accessible bucket ids from a GET_CAPABILITIES payload.
+
+    The ``/authenticate/info`` response shape varies by account tier and SDK
+    version, so we probe the known location and accept only non-empty strings
+    (or ``{bucket|name|id}`` objects). Returns ``[]`` when none are found, which
+    signals the caller to fall back to the curated default list.
+    """
+    if not isinstance(caps, dict):
+        return []
+    raw = caps.get('buckets')
+    if not isinstance(raw, list):
+        return []
+
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for item in raw:
+        name = None
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            candidate = item.get('bucket') or item.get('name') or item.get('id')
+            if isinstance(candidate, str):
+                name = candidate.strip()
+        if name and name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def resolve_buckets(ix: Any, log: logging.Logger) -> Tuple[str, ...]:
+    """Return the buckets to search.
+
+    Prefers the account's actually-licensed buckets (so freshly-added sources
+    such as stealer logs are covered without editing the code); falls back to
+    the curated ``BUCKETS`` default whenever capabilities can't be determined.
+    """
+    try:
+        caps = ix.GET_CAPABILITIES()
+    except Exception as e:  # noqa: BLE001 - a best-effort probe must never abort the run
+        log.debug(f"GET_CAPABILITIES failed ({e}); using default bucket list")
+        return BUCKETS
+
+    buckets = _extract_buckets_from_capabilities(caps)
+    if buckets:
+        log.info(f"Using {len(buckets)} licensed buckets from account capabilities")
+        log.debug(f"Licensed buckets: {buckets}")
+        return tuple(buckets)
+
+    log.debug("Could not determine licensed buckets from capabilities; using default list")
+    return BUCKETS
 
 
 # ── Resume: load previously saved credentials ───────────────────────────────
-seen = set()
+def load_existing_dedup(output_file: str, output_format: str, log: logging.Logger) -> Set[str]:
+    """Load dedup keys from an existing output file so resumed runs skip them.
 
-if os.path.exists(output_file):
+    Failure to parse the existing file is non-fatal: it returns whatever was
+    loaded so far (possibly empty). The on-write dedup pass is the safety net.
+    """
+    seen: Set[str] = set()
+    if not os.path.exists(output_file):
+        return seen
+
     log.info(f"Resuming: loading existing credentials from {output_file}")
     try:
-        if args.format == 'json':
+        if output_format == 'json':
             with open(output_file, 'r') as f:
                 existing = json.load(f)
             for entry in existing:
@@ -316,7 +460,7 @@ if os.path.exists(output_file):
                 password = entry.get('password', '')
                 if identity and password:
                     seen.add(f"{identity.lower()}:{password}")
-        elif args.format == 'csv':
+        elif output_format == 'csv':
             with open(output_file, 'r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -336,167 +480,509 @@ if os.path.exists(output_file):
                         else:
                             seen.add(line.lower())
         log.info(f"Loaded {len(seen)} existing credentials for dedup")
-    except (json.JSONDecodeError, FileNotFoundError, StopIteration):
-        log.warning(f"Could not parse existing output file, starting fresh dedup")
-    except Exception as e:
-        log.warning(f"Error loading existing output: {e}")
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        log.warning(f"Could not parse existing output file ({e}); starting fresh dedup")
+    return seen
 
 
-# ── Helper: FILE_VIEW with retries ──────────────────────────────────────────
-def file_view_with_retry(ix, leak, max_retries=MAX_RETRIES):
-    """Call FILE_VIEW with exponential backoff retry."""
-    delay = RETRY_DELAY
-    for attempt in range(1, max_retries + 1):
+# ── FILE_VIEW with retries ──────────────────────────────────────────────────
+def file_view_with_retry(
+    ix: Any,
+    leak: Dict[str, Any],
+    log: logging.Logger,
+    retry: RetryConfig = RetryConfig(),
+) -> str:
+    """Call FILE_VIEW with exponential backoff retry. Re-raises after the last attempt."""
+    delay = retry.retry_delay
+    for attempt in range(1, retry.max_retries + 1):
         try:
-            return ix.FILE_VIEW(leak['type'], leak['media'],
-                                leak['storageid'], leak['bucket'])
-        except Exception as e:
-            if attempt == max_retries:
+            return ix.FILE_VIEW(leak['type'], leak['media'], leak['storageid'], leak['bucket'])
+        except EXPECTED_LEAK_ERRORS as e:
+            if attempt == retry.max_retries:
                 raise
-            log.warning(f"FILE_VIEW attempt {attempt}/{max_retries} failed: {e}. Retrying in {delay}s...")
+            log.warning(f"FILE_VIEW attempt {attempt}/{retry.max_retries} failed: {e}. Retrying in {delay}s...")
             time.sleep(delay)
             delay *= 2
     return ""
 
 
-# ── Process leaks ───────────────────────────────────────────────────────────
-new_creds = []   # list of dicts for json/csv output
-extraction_stats = {
-    'lines_scanned': 0,
-    'candidates_extracted': 0,
-    'pattern_skips': 0,
-    'low_confidence_skips': 0,
-    'target_skips': 0,
-    'multi_candidate_lines': 0,
-    'duplicates': 0,
-    'new_credentials': 0,
-}
+# ── Rate limiting & progress ─────────────────────────────────────────────────
+class RateLimiter:
+    """Enforce a minimum spacing between calls across threads."""
 
-try:
-    for i, leak in enumerate(results):
-        try:
-            log.debug(f"Processing leak [{i+1}/{len(results)}]: {leak['name']}")
-            contents = file_view_with_retry(ix, leak)
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self._lock = threading.Lock()
+        self._last = 0.0
 
-            for line in contents.split('\n'):
-                line_stripped = line.strip()
-                if not line_stripped:
-                    continue
+    def wait(self) -> None:
+        """Block until at least ``delay`` seconds have elapsed since the previous call."""
+        if self.delay <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            sleep_for = self.delay - (now - self._last)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            self._last = time.monotonic()
 
-                extraction_stats['lines_scanned'] += 1
 
-                candidates = extract_credentials_from_line(line_stripped, mode=args.mode)
-                if not candidates:
-                    extraction_stats['pattern_skips'] += 1
-                    log.debug(f"Skipped (no valid credential pattern): {line_stripped}")
-                    continue
+class ProgressReporter:
+    """Lightweight progress reporting for the leak-processing loop.
 
-                extraction_stats['candidates_extracted'] += len(candidates)
-                accepted_for_line = 0
+    Uses tqdm when available; otherwise prints a carriage-return counter to a
+    TTY, and stays silent (the per-leak logs suffice) when output isn't a TTY
+    or DEBUG logging is on.
+    """
 
-                for candidate in candidates:
-                    if candidate['confidence'] < EXTRACTION_MODES[args.mode]['min_confidence']:
-                        extraction_stats['low_confidence_skips'] += 1
-                        log.debug(
-                            f"Skipped (low confidence {candidate['confidence']:.2f}): {candidate['canonical']}"
-                        )
-                        continue
+    def __init__(self, total: int, enabled: bool) -> None:
+        self.total = total
+        self.count = 0
+        self.found = 0
+        self._lock = threading.Lock()
+        self._bar = None
+        self._tty = enabled and sys.stderr.isatty()
+        if enabled and _tqdm is not None:
+            self._bar = _tqdm(total=total, unit='leak', desc='Processing leaks')
 
-                    if person_context:
-                        target_match = candidate_mentions_person_email(candidate, line_stripped, person_context)
-                    else:
-                        target_match = candidate_mentions_target(candidate, line_stripped, target_context)
+    def update(self, found_delta: int = 0) -> None:
+        """Advance the progress counter by one leak and ``found_delta`` credentials."""
+        with self._lock:
+            self.count += 1
+            self.found += found_delta
+            if self._bar is not None:
+                self._bar.set_postfix(found=self.found, refresh=False)
+                self._bar.update(1)
+            elif self._tty:
+                sys.stderr.write(
+                    f"\rProcessing leak {self.count}/{self.total} ({self.found} new creds)"
+                )
+                sys.stderr.flush()
 
-                    if not target_match:
-                        extraction_stats['target_skips'] += 1
-                        log.debug(f"Skipped (target mismatch): {candidate['canonical']}")
-                        continue
+    def close(self) -> None:
+        """Finalize the progress display."""
+        if self._bar is not None:
+            self._bar.close()
+        elif self._tty:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
-                    cred_key = candidate['dedup_key']
 
-                    if cred_key in seen:
-                        extraction_stats['duplicates'] += 1
-                        log.debug(f"Duplicate skipped: {candidate['canonical']}")
-                        continue
+# ── Process leaks ────────────────────────────────────────────────────────────
+def _new_stats() -> Dict[str, int]:
+    """Return a zeroed extraction-stats dict."""
+    return {
+        'lines_scanned': 0,
+        'candidates_extracted': 0,
+        'pattern_skips': 0,
+        'low_confidence_skips': 0,
+        'target_skips': 0,
+        'multi_candidate_lines': 0,
+        'duplicates': 0,
+        'new_credentials': 0,
+    }
 
-                    seen.add(cred_key)
 
-                    identity = candidate['identity']
-                    email_value = identity if '@' in identity else ''
+def _process_contents(
+    contents: str,
+    leak: Dict[str, Any],
+    *,
+    mode: str,
+    target: str,
+    target_context: Any,
+    person_context: Any,
+    seen: Set[str],
+    new_creds: List[Dict[str, Any]],
+    stats: Dict[str, int],
+    log: logging.Logger,
+    scorer: Optional[ConfidenceModel] = None,
+) -> int:
+    """Extract, filter and dedup credentials from one leak's contents.
 
-                    new_creds.append({
-                        'url': candidate['url'],
-                        'identity': identity,
-                        'email': email_value,
-                        'password': candidate['password'],
-                        'source': leak.get('name', 'unknown'),
-                        'raw_line': line_stripped,
-                        'raw': line_stripped,
-                        'canonical': candidate['canonical'],
-                        'confidence': candidate['confidence'],
-                        'pattern': candidate['pattern'],
-                    })
-                    extraction_stats['new_credentials'] += 1
-                    accepted_for_line += 1
-                    log.info(
-                        f"Found ({candidate['pattern']} {candidate['confidence']:.2f}): "
-                        f"{candidate['canonical']}"
-                    )
+    Mutates ``seen``, ``new_creds`` and ``stats`` in place. The caller is
+    responsible for serializing access to those structures. Returns the number
+    of credentials newly accepted from this leak.
 
-                if accepted_for_line > 1:
-                    extraction_stats['multi_candidate_lines'] += 1
+    When ``scorer`` is supplied, each candidate's heuristic ``confidence`` is
+    replaced by the model's probability before the threshold check, so the ML
+    model drives acceptance without touching the extractor itself.
+    """
+    min_confidence = EXTRACTION_MODES[mode]['min_confidence']
+    accepted_total = 0
 
-        except Exception as e:
-            log.error(f"Error processing leak {leak.get('name', 'unknown')}: {e}")
+    for line in contents.split('\n'):
+        line_stripped = line.strip()
+        if not line_stripped:
             continue
 
-        # rate limiting between FILE_VIEW calls
-        if i < len(results) - 1:
-            time.sleep(REQUEST_DELAY)
+        stats['lines_scanned'] += 1
 
-    # ── Write output ─────────────────────────────────────────────────────────
-    if not new_creds:
-        log.info("No new credentials found")
+        candidates = extract_credentials_from_line(line_stripped, mode=mode)
+        if not candidates:
+            stats['pattern_skips'] += 1
+            log.debug(f"Skipped (no valid credential pattern): {line_stripped}")
+            continue
+
+        stats['candidates_extracted'] += len(candidates)
+        accepted_for_line = 0
+
+        for candidate in candidates:
+            if scorer is not None:
+                candidate['confidence'] = scorer.score(candidate, line_stripped)
+            if candidate['confidence'] < min_confidence:
+                stats['low_confidence_skips'] += 1
+                log.debug(f"Skipped (low confidence {candidate['confidence']:.2f}): {candidate['canonical']}")
+                continue
+
+            if person_context:
+                target_match = candidate_mentions_person_email(candidate, line_stripped, person_context)
+            else:
+                target_match = candidate_mentions_target(candidate, line_stripped, target_context)
+
+            if not target_match:
+                stats['target_skips'] += 1
+                log.debug(f"Skipped (target mismatch): {candidate['canonical']}")
+                continue
+
+            cred_key = candidate['dedup_key']
+            if cred_key in seen:
+                stats['duplicates'] += 1
+                log.debug(f"Duplicate skipped: {candidate['canonical']}")
+                continue
+
+            seen.add(cred_key)
+
+            identity = candidate['identity']
+            email_value = identity if '@' in identity else ''
+
+            new_creds.append({
+                'url': candidate['url'],
+                'identity': identity,
+                'email': email_value,
+                'password': candidate['password'],
+                'source': leak.get('name', 'unknown'),
+                'raw_line': line_stripped,
+                'raw': line_stripped,
+                'canonical': candidate['canonical'],
+                'confidence': candidate['confidence'],
+                'pattern': candidate['pattern'],
+            })
+            stats['new_credentials'] += 1
+            accepted_for_line += 1
+            accepted_total += 1
+            log.info(f"Found ({candidate['pattern']} {candidate['confidence']:.2f}): {candidate['canonical']}")
+
+        if accepted_for_line > 1:
+            stats['multi_candidate_lines'] += 1
+
+    return accepted_total
+
+
+def process_leaks(
+    ix: Any,
+    results: List[Dict[str, Any]],
+    *,
+    mode: str,
+    target: str,
+    target_context: Any,
+    person_context: Any,
+    seen: Set[str],
+    log: logging.Logger,
+    workers: int = DEFAULT_WORKERS,
+    delay: float = REQUEST_DELAY,
+    retry: RetryConfig = RetryConfig(),
+    scorer: Optional[ConfidenceModel] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Fetch and process every leak, optionally with bounded concurrency.
+
+    FILE_VIEW network calls run on up to ``workers`` threads (rate-limited by
+    ``delay``); credential extraction, dedup and result accumulation are
+    serialized under a lock so ``seen``/``new_creds``/``stats`` stay consistent
+    and writes remain thread-safe. With ``workers == 1`` this is equivalent to
+    the original strictly-sequential behavior.
+    """
+    new_creds: List[Dict[str, Any]] = []
+    stats = _new_stats()
+    total = len(results)
+    limiter = RateLimiter(delay)
+    lock = threading.Lock()
+    progress = ProgressReporter(total, enabled=log.level > logging.DEBUG)
+
+    def handle(index: int, leak: Dict[str, Any]) -> None:
+        log.debug(f"Processing leak [{index + 1}/{total}]: {leak.get('name', 'unknown')}")
+        limiter.wait()
+        try:
+            contents = file_view_with_retry(ix, leak, log, retry)
+        except EXPECTED_LEAK_ERRORS as e:
+            log.error(f"Error processing leak {leak.get('name', 'unknown')}: {e}")
+            progress.update(0)
+            return
+
+        with lock:
+            try:
+                accepted = _process_contents(
+                    contents,
+                    leak,
+                    mode=mode,
+                    target=target,
+                    target_context=target_context,
+                    person_context=person_context,
+                    seen=seen,
+                    new_creds=new_creds,
+                    stats=stats,
+                    log=log,
+                    scorer=scorer,
+                )
+            except EXPECTED_LEAK_ERRORS as e:
+                log.error(f"Error processing leak {leak.get('name', 'unknown')}: {e}")
+                accepted = 0
+        progress.update(accepted)
+
+    try:
+        if workers <= 1:
+            for i, leak in enumerate(results):
+                handle(i, leak)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(handle, i, leak) for i, leak in enumerate(results)]
+                for future in as_completed(futures):
+                    # Surface genuinely unexpected errors instead of swallowing them.
+                    future.result()
+    finally:
+        progress.close()
+
+    return new_creds, stats
+
+
+# ── Output writing ───────────────────────────────────────────────────────────
+def _load_json_entries(output_file: str, log: logging.Logger) -> List[Dict[str, Any]]:
+    """Load existing JSON entries, recovering gracefully from corruption."""
+    if not os.path.exists(output_file):
+        return []
+    try:
+        with open(output_file, 'r') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        backup = output_file + '.corrupt'
+        try:
+            os.replace(output_file, backup)
+            log.warning(f"Existing JSON output was corrupt ({e}); backed up to {backup}")
+        except OSError:
+            log.warning(f"Existing JSON output was corrupt ({e}); could not back it up")
+        return []
+    if not isinstance(data, list):
+        log.warning("Existing JSON output is not a list; ignoring it for merge")
+        return []
+    return data
+
+
+def _atomic_write_json(output_file: str, entries: List[Dict[str, Any]]) -> None:
+    """Write ``entries`` to a temp file in the same directory, then atomically rename."""
+    directory = os.path.dirname(output_file) or '.'
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{output_file}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, 'w') as f:
+            json.dump(entries, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, output_file)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def write_json_output(new_creds: List[Dict[str, Any]], output_file: str, log: logging.Logger) -> int:
+    """Merge new credentials with any existing entries and write atomically."""
+    existing = _load_json_entries(output_file, log)
+    _atomic_write_json(output_file, existing + new_creds)
+    return len(new_creds)
+
+
+def _existing_csv_keys(output_file: str, log: logging.Logger) -> Set[str]:
+    """Read dedup keys already present in a CSV output file (best effort)."""
+    keys: Set[str] = set()
+    if not (os.path.exists(output_file) and os.path.getsize(output_file) > 0):
+        return keys
+    try:
+        with open(output_file, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                identity = row.get('identity') or row.get('email', '')
+                password = row.get('password', '')
+                if identity and password:
+                    keys.add(f"{identity.lower()}:{password}")
+    except (OSError, csv.Error) as e:
+        log.warning(f"Could not re-read existing CSV for dedup ({e}); relying on in-memory set")
+    return keys
+
+
+CSV_FIELDNAMES = [
+    'url',
+    'identity',
+    'email',
+    'password',
+    'source',
+    'confidence',
+    'pattern',
+    'canonical',
+    'raw_line',
+]
+
+
+def write_csv_output(new_creds: List[Dict[str, Any]], output_file: str, log: logging.Logger) -> int:
+    """Append new credentials to a CSV, deduping against what is already on disk.
+
+    This second-pass dedup is resilient even if the in-memory ``seen`` set
+    failed to load, so duplicates are never appended.
+    """
+    on_disk = _existing_csv_keys(output_file, log)
+    file_exists = os.path.exists(output_file) and os.path.getsize(output_file) > 0
+
+    rows: List[Dict[str, Any]] = []
+    for cred in new_creds:
+        identity = (cred.get('identity') or '')
+        password = cred.get('password', '')
+        key = f"{identity.lower()}:{password}"
+        if key in on_disk:
+            continue
+        on_disk.add(key)
+        rows.append(cred)
+
+    if not rows and file_exists:
+        return 0
+
+    directory = os.path.dirname(output_file) or '.'
+    os.makedirs(directory, exist_ok=True)
+    with open(output_file, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        if not file_exists:
+            writer.writeheader()
+        for cred in rows:
+            writer.writerow({key: cred.get(key, '') for key in CSV_FIELDNAMES})
+    return len(rows)
+
+
+def write_txt_output(new_creds: List[Dict[str, Any]], output_file: str, log: logging.Logger) -> int:
+    """Append canonical credential strings to a plain-text file."""
+    directory = os.path.dirname(output_file) or '.'
+    os.makedirs(directory, exist_ok=True)
+    with open(output_file, 'a') as f:
+        for cred in new_creds:
+            f.write(f"{cred['canonical']}\n")
+    return len(new_creds)
+
+
+def write_output(
+    new_creds: List[Dict[str, Any]],
+    output_file: str,
+    output_format: str,
+    log: logging.Logger,
+) -> int:
+    """Dispatch to the format-specific writer. Returns the number of rows written."""
+    if output_format == 'json':
+        return write_json_output(new_creds, output_file, log)
+    if output_format == 'csv':
+        return write_csv_output(new_creds, output_file, log)
+    return write_txt_output(new_creds, output_file, log)
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point. Returns a process exit code."""
+    args = parse_args(argv)
+    log = configure_logging(args.debug)
+
+    output_file = resolve_output_path(args)
+
+    api_key = resolve_api_key(args, log)
+    if not api_key:
+        log.error(
+            "API key is required. Please provide it using -k or set INTELX_API_KEY in your environment variables."
+        )
+        return 1
+
+    intelx_client = load_intelx_client()
+    if intelx_client is None:
+        log.error("IntelX SDK not installed. Install dependencies with: pip install -r requirements.txt")
+        return 1
+
+    date_from, date_to = compute_date_range(args.range)
+    log.info(f"Searching from {date_from} to {date_to}")
+
+    target = args.target
+    target_is_email = is_email_target(target)
+    target_context = build_target_context(target)
+    person_context = (
+        build_person_email_context(target, person_name=args.person_name) if target_is_email else None
+    )
+
+    if args.person_name and not target_is_email:
+        log.warning("--person-name is most useful with an email target and will be ignored for domain targets")
+
+    search_terms = build_search_terms(
+        target,
+        include_email_pattern=args.email,
+        person_name=args.person_name,
+        company_wide=args.company_wide,
+    )
+    if target_is_email:
+        log.info(f"Person-email mode enabled. Generated {len(search_terms)} search terms for '{target}'.")
     else:
-        if args.format == 'json':
-            # merge with existing entries if resuming
-            existing_entries = []
-            if os.path.exists(output_file):
-                try:
-                    with open(output_file, 'r') as f:
-                        existing_entries = json.load(f)
-                except (json.JSONDecodeError, FileNotFoundError):
-                    pass
-            all_entries = existing_entries + new_creds
-            with open(output_file, 'w') as f:
-                json.dump(all_entries, f, indent=2)
+        log.info(f"Domain mode: searching selector(s) {search_terms}")
+        if args.company_wide:
+            log.info("Company-wide search enabled: also sweeping the bare domain")
 
-        elif args.format == 'csv':
-            file_exists = os.path.exists(output_file) and os.path.getsize(output_file) > 0
-            with open(output_file, 'a', newline='') as f:
-                fieldnames = [
-                    'url',
-                    'identity',
-                    'email',
-                    'password',
-                    'source',
-                    'confidence',
-                    'pattern',
-                    'canonical',
-                    'raw_line',
-                ]
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                if not file_exists:
-                    writer.writeheader()
-                for cred in new_creds:
-                    writer.writerow({key: cred.get(key, '') for key in fieldnames})
+    try:
+        ix = intelx_client(api_key)
+        log.debug(f"IntelX API initialized for target: {target}")
+        buckets = resolve_buckets(ix, log)
+        results = run_search(ix, search_terms, buckets, date_from, date_to, args.maxresults, log)
+    except EXPECTED_LEAK_ERRORS as e:
+        log.error(f"Error searching IntelX API: {e}")
+        return 1
 
-        else:  # txt
-            with open(output_file, 'a') as f:
-                for cred in new_creds:
-                    f.write(f"{cred['canonical']}\n")
+    os.makedirs('out', exist_ok=True)
 
-        log.info(f"Wrote {len(new_creds)} new credentials to: {output_file}")
+    scorer: Optional[ConfidenceModel] = None
+    if args.model:
+        scorer = ConfidenceModel.load(args.model)
+        if scorer is None:
+            log.warning(
+                f"Confidence model not usable at '{args.model}'; falling back to heuristic scoring. "
+                "Train one with: python train_confidence_model.py"
+            )
+        else:
+            log.info(f"Using ML confidence model from '{args.model}' (mode threshold acts as a probability cutoff)")
+
+    seen = load_existing_dedup(output_file, args.format, log)
+
+    new_creds, stats = process_leaks(
+        ix,
+        results,
+        mode=args.mode,
+        target=target,
+        target_context=target_context,
+        person_context=person_context,
+        seen=seen,
+        log=log,
+        workers=args.workers,
+        delay=args.delay,
+        scorer=scorer,
+    )
+
+    try:
+        if not new_creds:
+            log.info("No new credentials found")
+        else:
+            written = write_output(new_creds, output_file, args.format, log)
+            log.info(f"Wrote {written} new credentials to: {output_file}")
+    except OSError as e:
+        log.error(f"Cannot create/write to output file {output_file}: {e}")
+        return 1
 
     if args.safe_share:
         try:
@@ -510,7 +996,7 @@ try:
                 log.info(f"Wrote {safe_count} anonymized credentials to safe-share file: {safe_output_file}")
             else:
                 log.info("Safe-share skipped: 0 anonymized credentials")
-        except Exception as e:
+        except (OSError, ValueError, json.JSONDecodeError, csv.Error) as e:
             log.error(f"Failed to create safe-share output: {e}")
 
     log.info(f"Total unique credentials (all runs): {len(seen)}")
@@ -519,15 +1005,10 @@ try:
         "pattern_skips: %(pattern_skips)s, low_conf: %(low_confidence_skips)s, "
         "target_skips: %(target_skips)s, multi_lines: %(multi_candidate_lines)s, "
         "duplicates: %(duplicates)s, new: %(new_credentials)s",
-        {
-            **extraction_stats,
-            'mode': args.mode,
-        },
+        {**stats, 'mode': args.mode},
     )
+    return 0
 
-except FileNotFoundError:
-    log.error(f"Cannot create/write to output file: {output_file}")
-    sys.exit(1)
-except Exception as e:
-    log.error(f"Error during credential search: {e}")
-    sys.exit(1)
+
+if __name__ == '__main__':
+    sys.exit(main())

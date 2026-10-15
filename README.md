@@ -13,6 +13,8 @@ A fast OSINT tool for searching leaked credentials using the Intelligence X API.
 ✅ **Flexible extraction** - Supports `:`, `;`, `|`, and key/value credential dumps  
 ✅ **Extraction modes** - `strict`, `balanced`, `aggressive` for precision/recall control  
 ✅ **Confidence scoring** - Every match includes parser pattern + confidence score  
+✅ **Optional ML model** - Train a stdlib logistic-regression scorer to filter false positives the heuristic over-trusts  
+✅ **Concurrent fetching** - Optional `--workers` for bounded-parallel leak downloads with rate limiting  
 ✅ **Multi-hit line parsing** - Extracts multiple credentials from a single leak line  
 ✅ **Person-email targeting** - Expands search terms and matches specifically for a person email  
 ✅ **Safe-share export** - Optional anonymized CSV output for external clients  
@@ -143,6 +145,45 @@ optional arguments:
 - **strict**: highest precision, drops low-confidence candidates
 - **balanced**: recommended default for most runs
 - **aggressive**: highest recall on noisy/non-standard dumps
+
+### ML Confidence Model (optional)
+
+By default, each candidate's confidence is computed by a hand-tuned heuristic.
+You can optionally score candidates with a trained logistic-regression model
+instead — it learns from data which extractions are real credentials versus
+junk (e.g. `admin:admin`, version strings, common passwords), which the
+heuristic tends to over-trust.
+
+The model is **pure standard library** (no scikit-learn, no new runtime deps)
+and is serialized as an inspectable JSON list of per-feature weights.
+
+Train a model:
+
+```bash
+# Self-contained: train on synthetic labeled data (good for a quick start/demo)
+python train_confidence_model.py --synthetic 600
+
+# Or weak-supervise from real dump files (labels bootstrapped from high-confidence
+# heuristic hits; trivial/ambiguous candidates handled automatically)
+python train_confidence_model.py --input dumps/*.txt --synthetic 200
+```
+
+This writes `models/confidence_model.json` and prints held-out
+accuracy/precision/recall/F1. Then score with it:
+
+```bash
+# Bare flag uses models/confidence_model.json
+./main.py -t domain.com --model
+
+# Or point at a specific model file
+./main.py -t domain.com --model path/to/model.json
+```
+
+When `--model` is active, the `--mode` threshold is interpreted as a
+**probability cutoff** (e.g. `strict` keeps only candidates the model scores
+≥ 0.82). If the model file is missing or incompatible, the scanner logs a
+warning and falls back to the heuristic. Trained model artifacts are gitignored;
+retrain periodically as leak formats drift.
 
 ### Person Target Search
 
