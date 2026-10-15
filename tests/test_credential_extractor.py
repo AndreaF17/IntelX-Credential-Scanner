@@ -90,6 +90,18 @@ class CredentialExtractorTests(unittest.TestCase):
         terms = build_search_terms('info@example.it', include_email_pattern=False, person_name=None)
         self.assertEqual(terms, ['info@example.it'])
 
+    def test_domain_target_defaults_to_email_selector(self):
+        # Domain targets should query the @domain selector, not the bare company
+        # name (which drags in ZoomInfo/CRM business-data documents).
+        self.assertEqual(build_search_terms('recordati.it'), ['@recordati.it'])
+        # A leading @ on the target must not double up.
+        self.assertEqual(build_search_terms('@recordati.it'), ['@recordati.it'])
+
+    def test_domain_target_company_wide_adds_bare_domain(self):
+        terms = build_search_terms('recordati.it', company_wide=True)
+        self.assertIn('@recordati.it', terms)
+        self.assertIn('recordati.it', terms)
+
     def test_malformed_ipv6_url_in_kv_does_not_raise(self):
         line = 'url=http://[2001:db8::1 user=admin password=Pass123!'
 
@@ -100,6 +112,75 @@ class CredentialExtractorTests(unittest.TestCase):
 
         self.assertTrue(candidates)
         self.assertTrue(any(item['url'].startswith('http://[2001') for item in candidates))
+
+    def _accepted(self, line, mode='balanced'):
+        """Candidates that clear the mode's confidence threshold (mirrors _process_contents)."""
+        min_conf = EXTRACTION_MODES[mode]['min_confidence']
+        return [
+            item
+            for item in extract_credentials_from_line(line, mode=mode)
+            if item['confidence'] >= min_conf
+        ]
+
+    def test_rejects_date_triplets(self):
+        # ZoomInfo / CRM exports produce colon/slash date rows that are not credentials.
+        for line in ('7/26/2016:7/1/2016:1/17/2019', '6/9/2025:6/1/2025:6/11/2025'):
+            self.assertEqual(self._accepted(line, mode='balanced'), [], line)
+            self.assertEqual(self._accepted(line, mode='aggressive'), [], line)
+
+    def test_rejects_numeric_and_money_triplets(self):
+        for line in ('2292377000.00:USD:2682082026', '00.000:Investment Advisor:Milano'):
+            self.assertEqual(self._accepted(line, mode='balanced'), [], line)
+            self.assertEqual(self._accepted(line, mode='aggressive'), [], line)
+
+    def test_rejects_crm_metadata_fields(self):
+        lines = (
+            'recordati.it:leadsourcecode@OData.Community.Display.V1.FormattedValue:Default Value',
+            'microsoft.dynamics.crm.lookuplogicalname:systemuser:_modifiedby_value',
+            'odata.community.display.v1.formattedvalue:Default Value:educationcode',
+        )
+        for line in lines:
+            self.assertEqual(self._accepted(line, mode='balanced'), [], line)
+            self.assertEqual(self._accepted(line, mode='aggressive'), [], line)
+
+    def test_rejects_placeholder_passwords(self):
+        for line in ('recordati.it:emailaddress2:null', 'app.corp.com:field:None'):
+            self.assertEqual(self._accepted(line, mode='balanced'), [], line)
+
+    def test_rejects_free_text_identities(self):
+        # Identities with whitespace are business-data columns, not usernames.
+        for line in ('recordati.it:Other Trade Show:Via Matteo', 'acme.com:Investment Advisor:Milano'):
+            self.assertEqual(self._accepted(line, mode='balanced'), [], line)
+
+    def test_rejects_dns_and_locator_chains(self):
+        # WHOIS/DNS dumps: every token is a host or IP, so none is a password.
+        lines = (
+            'dns.technorail.com:dns2.technorail.com:dns3.arubadns.net',
+            'dns3.arubadns.net:dns4.arubadns.cz:213.61.202.248',
+            'host.com:camperiosim@camperio.net:camperio@legalmail.it',
+        )
+        for line in lines:
+            self.assertEqual(self._accepted(line, mode='balanced'), [], line)
+            self.assertEqual(self._accepted(line, mode='aggressive'), [], line)
+
+    def test_keeps_host_as_identity_credential(self):
+        # A hostname identity with a real password must still pass.
+        line = 'stage.ivsanbernard.it/:stage.ivsanbernard.it:Nonmelaricordo1'
+        self.assertTrue(self._accepted(line, mode='balanced'), line)
+
+    def test_keeps_real_email_credentials(self):
+        # Genuine combolist rows (as in the clean gamelife.it output) must survive.
+        line = 'www.gamelife.it:revelth26@gmail.com:RainbowSixSiege12'
+        accepted = self._accepted(line, mode='balanced')
+        self.assertTrue(accepted)
+        self.assertEqual(accepted[0]['identity'], 'revelth26@gmail.com')
+        self.assertEqual(accepted[0]['password'], 'RainbowSixSiege12')
+
+    def test_keeps_url_email_password(self):
+        line = 'https://www.gamelife.it/customer/account/login/:attilio92@tiscali.it:Metallica92*'
+        accepted = self._accepted(line, mode='balanced')
+        self.assertTrue(accepted)
+        self.assertEqual(accepted[0]['identity'], 'attilio92@tiscali.it')
 
     def test_person_email_matching_is_not_domain_only(self):
         context = build_person_email_context('john.doe@example.com')
