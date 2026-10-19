@@ -17,6 +17,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -129,6 +130,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help='For a domain target, also search the bare domain (not just @domain). '
              'Catches host-form creds (domain:user:pass) at the cost of fetching '
              'more business-data documents, which the extractor then filters out.',
+    )
+    parser.add_argument(
+        '--expand-archives', action='store_true',
+        help='Walk multi-file leaks (archives/folders) via the treeview and fetch '
+             'each child file, so credentials inside bundles are not missed. '
+             'Adds one treeview + extra FILE_VIEW calls per container.',
+    )
+    parser.add_argument(
+        '--phonebook', action='store_true',
+        help='Also run an IntelX Phonebook search to enumerate leaked selectors '
+             '(emails/domains) for the target, written to out/<target>-emails.txt.',
     )
     parser.add_argument(
         '--person-name',
@@ -448,6 +460,182 @@ def resolve_buckets(ix: Any, log: logging.Logger) -> Tuple[str, ...]:
 
     log.debug("Could not determine licensed buckets from capabilities; using default list")
     return BUCKETS
+
+
+# ── Multi-file archive expansion ─────────────────────────────────────────────
+# Many leaks (stealer logs, combolist bundles) are archives/folders. FILE_VIEW on
+# the container's storage id returns an index, not the credential text, so we walk
+# the treeview and fetch each child file instead.
+_ARCHIVE_EXTS: Tuple[str, ...] = (
+    '.zip', '.rar', '.7z', '.tar', '.tar.gz', '.tgz', '.gz', '.bz2', '.xz',
+)
+_TREEVIEW_SID_RE = re.compile(r'storageid=([^&"\'\s<>]+)', re.IGNORECASE)
+_TREEVIEW_BUCKET_RE = re.compile(r'bucket=([^&"\'\s<>]+)', re.IGNORECASE)
+_TREEVIEW_TYPE_RE = re.compile(r'[?&]type=(\d+)', re.IGNORECASE)
+_TREEVIEW_NAME_RE = re.compile(r'>([^<>]+)</a>')
+
+
+def _looks_like_container(record: Dict[str, Any]) -> bool:
+    """Heuristic: does this search record look like an archive/folder bundle?"""
+    name = str(record.get('name') or '').strip().lower()
+    return bool(name) and name.endswith(_ARCHIVE_EXTS)
+
+
+def _parse_treeview_children(treeview_html: str, parent: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract child-file leak records from a FILE_TREE_VIEW HTML payload.
+
+    Child storage ids / buckets live in the ``<a href>`` links; missing fields are
+    inherited from ``parent`` so each child carries everything FILE_VIEW needs.
+    """
+    children: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for line in treeview_html.replace('&amp;', '&').split('\n'):
+        if 'storageid=' not in line:
+            continue
+        sid_match = _TREEVIEW_SID_RE.search(line)
+        if not sid_match:
+            continue
+        sid = sid_match.group(1)
+        if not sid or sid == parent.get('storageid') or sid in seen:
+            continue
+        seen.add(sid)
+
+        bucket_match = _TREEVIEW_BUCKET_RE.search(line)
+        type_match = _TREEVIEW_TYPE_RE.search(line)
+        name_match = _TREEVIEW_NAME_RE.search(line)
+        children.append({
+            'storageid': sid,
+            'bucket': bucket_match.group(1) if bucket_match else parent.get('bucket', ''),
+            'type': int(type_match.group(1)) if type_match else parent.get('type', 0),
+            'media': parent.get('media', 0),
+            'name': name_match.group(1).strip() if name_match else f"{parent.get('name', 'archive')}/{sid}",
+        })
+    return children
+
+
+def expand_container_leaks(ix: Any, results: List[Dict[str, Any]], log: logging.Logger) -> List[Dict[str, Any]]:
+    """Return ``results`` with the child files of any archive/folder records appended.
+
+    The original records are always preserved; any treeview failure is swallowed so
+    expansion can never lose a result or abort the run.
+    """
+    expanded: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    for record in results:
+        expanded.append(record)
+        sid = record.get('storageid')
+        if sid:
+            seen_ids.add(sid)
+        if not _looks_like_container(record):
+            continue
+
+        try:
+            treeview = ix.FILE_TREE_VIEW(record.get('storageid'))
+        except EXPECTED_LEAK_ERRORS as e:
+            log.debug(f"FILE_TREE_VIEW failed for '{record.get('name')}': {e}")
+            continue
+        if not isinstance(treeview, str) or not treeview.strip():
+            continue
+
+        added = 0
+        for child in _parse_treeview_children(treeview, record):
+            child_sid = child.get('storageid')
+            if child_sid and child_sid not in seen_ids:
+                seen_ids.add(child_sid)
+                expanded.append(child)
+                added += 1
+        if added:
+            log.info(f"Expanded container '{record.get('name')}' into {added} child file(s)")
+    return expanded
+
+
+# ── Phonebook (selector) discovery ───────────────────────────────────────────
+# The IntelX Phonebook returns the *selectors* (emails, domains, URLs) tied to a
+# term — a direct enumeration of leaked identities under a domain. The SDK's
+# phonebooksearch() convenience calls sys.exit() on error, so we poll the raw
+# endpoints ourselves and fail soft.
+_PHONEBOOK_MAX_PAGES: int = 50
+
+
+def _selector_value(selector: Any) -> str:
+    if isinstance(selector, dict):
+        value = selector.get('selectorvalue') or selector.get('value') or ''
+        return value.strip() if isinstance(value, str) else ''
+    if isinstance(selector, str):
+        return selector.strip()
+    return ''
+
+
+def run_phonebook_search(
+    ix: Any,
+    term: str,
+    buckets: Iterable[str],
+    date_from: str,
+    date_to: str,
+    max_results: int,
+    log: logging.Logger,
+    poll_delay: float = 0.0,
+) -> List[str]:
+    """Enumerate selector values for ``term`` across ``buckets``, deduplicated."""
+    selectors: List[str] = []
+    seen: Set[str] = set()
+
+    for bucket in buckets:
+        try:
+            search_id = ix.PHONEBOOK_SEARCH(
+                term, maxresults=max_results, buckets=[bucket], datefrom=date_from, dateto=date_to,
+            )
+        except EXPECTED_LEAK_ERRORS as e:
+            log.warning(f"Phonebook search failed for '{term}' in '{bucket}': {e}")
+            continue
+
+        # The SDK returns a long search-id string on success, or a short error code.
+        if not isinstance(search_id, str) or len(search_id) <= 3:
+            log.debug(f"Phonebook search not started for '{bucket}' (response: {search_id!r})")
+            continue
+
+        remaining = max_results
+        for _ in range(_PHONEBOOK_MAX_PAGES):
+            try:
+                page = ix.PHONEBOOK_SEARCH_RESULT(search_id, limit=max(remaining, 1))
+            except EXPECTED_LEAK_ERRORS as e:
+                log.debug(f"Phonebook result fetch failed for '{bucket}': {e}")
+                break
+            if not isinstance(page, dict):
+                break
+
+            page_selectors = page.get('selectors') or []
+            for selector in page_selectors:
+                value = _selector_value(selector)
+                key = value.lower()
+                if value and key not in seen:
+                    seen.add(key)
+                    selectors.append(value)
+
+            remaining -= len(page_selectors)
+            status = page.get('status')
+            # 1 = no more results, 2 = search id not found; 0/3 = keep polling.
+            if status in (1, 2) or remaining <= 0:
+                break
+            if poll_delay:
+                time.sleep(poll_delay)
+
+    log.info(f"Phonebook discovery found {len(selectors)} unique selector(s)")
+    return selectors
+
+
+def write_phonebook_output(selectors: Iterable[str], output_path: str, log: logging.Logger) -> int:
+    """Write discovered selectors (one per line) to ``output_path``; returns the count."""
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    written = 0
+    with open(output_path, 'w') as f:
+        for selector in selectors:
+            f.write(f"{selector}\n")
+            written += 1
+    log.info(f"Wrote {written} discovered selector(s) to: {output_path}")
+    return written
 
 
 # ── Resume: load previously saved credentials ───────────────────────────────
@@ -969,11 +1157,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.debug(f"IntelX API initialized for target: {target}")
         buckets = resolve_buckets(ix, log)
         results = run_search(ix, search_terms, buckets, date_from, date_to, args.maxresults, log)
+        if args.expand_archives:
+            results = expand_container_leaks(ix, results, log)
     except EXPECTED_LEAK_ERRORS as e:
         log.error(f"Error searching IntelX API: {e}")
         return 1
 
     os.makedirs('out', exist_ok=True)
+
+    if args.phonebook:
+        try:
+            discovered: List[str] = []
+            discovered_seen: Set[str] = set()
+            for term in search_terms:
+                for value in run_phonebook_search(
+                    ix, term, buckets, date_from, date_to, args.maxresults, log, poll_delay=args.delay,
+                ):
+                    if value.lower() not in discovered_seen:
+                        discovered_seen.add(value.lower())
+                        discovered.append(value)
+            emails_path = os.path.join('out', f"{args.target}-emails.txt")
+            write_phonebook_output(discovered, emails_path, log)
+        except EXPECTED_LEAK_ERRORS as e:
+            log.error(f"Phonebook discovery failed: {e}")
 
     scorer: Optional[ConfidenceModel] = None
     if args.model:
