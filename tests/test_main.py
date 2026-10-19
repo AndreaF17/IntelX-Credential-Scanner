@@ -312,6 +312,134 @@ class ComputeDateRangeTests(unittest.TestCase):
         self.assertTrue(date_to.endswith('23:59:59'))
 
 
+class TreeExpansionTests(unittest.TestCase):
+    def setUp(self):
+        self.log = _silent_logger()
+
+    def test_looks_like_container_by_extension(self):
+        self.assertTrue(main._looks_like_container({'name': 'Combo_2024.zip'}))
+        self.assertTrue(main._looks_like_container({'name': 'stealer-logs.tar.gz'}))
+        self.assertFalse(main._looks_like_container({'name': 'combolist.txt'}))
+        self.assertFalse(main._looks_like_container({'name': ''}))
+        self.assertFalse(main._looks_like_container({}))
+
+    def test_parses_children_from_treeview_html(self):
+        html = (
+            'dump/\r\n'
+            '  <a href="/file/read?type=1&amp;storageid=CHILD-AAA&amp;bucket=leaks.logs&amp;k=KEY">passwords.txt</a>\r\n'
+            '  <a href="/file/read?type=1&amp;storageid=CHILD-BBB&amp;bucket=leaks.logs">autofills.txt</a>\r\n'
+        )
+        parent = {'storageid': 'PARENT', 'bucket': 'leaks.private', 'type': 7, 'media': 0, 'name': 'dump.zip'}
+        children = main._parse_treeview_children(html, parent)
+        self.assertEqual({c['storageid'] for c in children}, {'CHILD-AAA', 'CHILD-BBB'})
+        self.assertEqual(children[0]['bucket'], 'leaks.logs')  # child bucket parsed from href
+        self.assertIn('passwords.txt', {c['name'] for c in children})
+        # Every child must carry the keys FILE_VIEW needs.
+        for c in children:
+            self.assertEqual(set(['type', 'media', 'storageid', 'bucket']) - set(c), set())
+
+    def test_child_inherits_parent_bucket_when_href_lacks_it(self):
+        html = '<a href="/file/read?storageid=KID">creds.txt</a>\r\n'
+        parent = {'storageid': 'P', 'bucket': 'leaks.private', 'type': 1, 'media': 0, 'name': 'x.zip'}
+        children = main._parse_treeview_children(html, parent)
+        self.assertEqual(children[0]['bucket'], 'leaks.private')
+
+    def test_expand_appends_children_and_keeps_parent(self):
+        html = '<a href="/file/read?storageid=KID&bucket=leaks.private">creds.txt</a>\r\n'
+
+        class TreeIX:
+            def FILE_TREE_VIEW(self, sid):
+                return html
+
+        results = [
+            {'storageid': 'P', 'bucket': 'leaks.private', 'type': 1, 'media': 0, 'name': 'x.zip'},
+            {'storageid': 'Q', 'bucket': 'leaks.private', 'type': 1, 'media': 0, 'name': 'plain.txt'},
+        ]
+        out = main.expand_container_leaks(TreeIX(), results, self.log)
+        self.assertEqual([r['storageid'] for r in out], ['P', 'KID', 'Q'])
+
+    def test_expand_resilient_to_failed_or_missing_treeview(self):
+        class FalseIX:
+            def FILE_TREE_VIEW(self, sid):
+                return False  # SDK returns False when it cannot generate a treeview
+
+        class RaiseIX:
+            def FILE_TREE_VIEW(self, sid):
+                raise OSError('network down')
+
+        results = [{'storageid': 'P', 'bucket': 'b', 'type': 1, 'media': 0, 'name': 'x.zip'}]
+        for ix in (FalseIX(), RaiseIX()):
+            out = main.expand_container_leaks(ix, results, self.log)
+            self.assertEqual([r['storageid'] for r in out], ['P'])
+
+
+class PhonebookSearchTests(unittest.TestCase):
+    def setUp(self):
+        self.log = _silent_logger()
+
+    def test_collects_and_dedups_selectors(self):
+        class PBIX:
+            def __init__(self):
+                self.n = 0
+
+            def PHONEBOOK_SEARCH(self, term, maxresults=100, buckets=None, datefrom='', dateto=''):
+                return 'SEARCHID1234'
+
+            def PHONEBOOK_SEARCH_RESULT(self, id, limit=1000, offset=-1):
+                self.n += 1
+                if self.n == 1:
+                    return {'status': 0, 'selectors': [{'selectorvalue': 'a@recordati.it'},
+                                                       {'selectorvalue': 'b@recordati.it'}]}
+                if self.n == 2:
+                    return {'status': 0, 'selectors': [{'selectorvalue': 'a@recordati.it'},
+                                                       {'selectorvalue': 'c@recordati.it'}]}
+                return {'status': 1, 'selectors': []}
+
+        res = main.run_phonebook_search(PBIX(), '@recordati.it', ['leaks.private'], 'd1', 'd2', 1000, self.log)
+        self.assertEqual(res, ['a@recordati.it', 'b@recordati.it', 'c@recordati.it'])
+
+    def test_handles_error_code_from_search_start(self):
+        class PBIX:
+            def PHONEBOOK_SEARCH(self, term, maxresults=100, buckets=None, datefrom='', dateto=''):
+                return 2  # short error code, not a search id
+
+            def PHONEBOOK_SEARCH_RESULT(self, *a, **k):
+                raise AssertionError('must not fetch results when search did not start')
+
+        self.assertEqual(main.run_phonebook_search(PBIX(), 't', ['b'], '', '', 10, self.log), [])
+
+    def test_status_3_keeps_polling(self):
+        class PBIX:
+            def __init__(self):
+                self.n = 0
+
+            def PHONEBOOK_SEARCH(self, term, maxresults=100, buckets=None, datefrom='', dateto=''):
+                return 'IDIDIDID'
+
+            def PHONEBOOK_SEARCH_RESULT(self, id, limit=1000, offset=-1):
+                self.n += 1
+                if self.n == 1:
+                    return {'status': 3, 'selectors': []}  # not ready yet
+                if self.n == 2:
+                    return {'status': 0, 'selectors': [{'selectorvalue': 'x@y.it'}]}
+                return {'status': 1, 'selectors': []}
+
+        self.assertEqual(main.run_phonebook_search(PBIX(), 't', ['b'], '', '', 100, self.log), ['x@y.it'])
+
+
+class PhonebookOutputTests(unittest.TestCase):
+    def setUp(self):
+        self.log = _silent_logger()
+
+    def test_writes_deduped_selectors(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'sub', 'emails.txt')
+        n = main.write_phonebook_output(['a@x.it', 'b@x.it'], path, self.log)
+        self.assertEqual(n, 2)
+        with open(path) as f:
+            self.assertEqual(f.read().split(), ['a@x.it', 'b@x.it'])
+
+
 class ProcessLeaksTests(unittest.TestCase):
     def setUp(self):
         self.log = _silent_logger()

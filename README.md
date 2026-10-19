@@ -84,6 +84,15 @@ Get your API key from: [https://intelx.io/](https://intelx.io/)
 # Enrich person-email searches with full name terms
 ./main.py -t john.doe@example.com --person-name "John Doe"
 
+# Also sweep the bare company name (not just @domain) for host-form creds
+./main.py -t domain.com --company-wide
+
+# Fetch files inside multi-file leaks (archives/stealer-log folders)
+./main.py -t domain.com --expand-archives
+
+# Enumerate leaked emails/selectors via Phonebook (-> out/domain.com-emails.txt)
+./main.py -t domain.com --phonebook
+
 # Create an anonymized safe-share file
 ./main.py -t domain.com --safe-share
 
